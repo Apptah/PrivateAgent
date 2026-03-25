@@ -123,4 +123,23 @@ static inline float pa_bits_from_x2(uint16_t bits_x2) {
     return (float)bits_x2 / 2.0f;
 }
 
+// ── Memory budget ──
+typedef struct {
+    uint64_t metal_buffers_bytes;
+    uint64_t gdn_state_bytes;
+    uint64_t expert_buffers_bytes;
+    uint64_t kv_cache_bytes;
+    uint64_t scratch_bytes;
+    uint64_t total_dirty_bytes;
+    uint64_t mmap_weights_bytes;
+    uint64_t total_resident_bytes;
+    uint32_t max_context_length;
+    uint32_t full_attn_layer_count;
+} PA_MemoryBudget;
+
+/// Compute a memory budget for the given model descriptor and available memory.
+/// Fills out_budget with breakdown and max_context_length.
+/// Returns PA_STATUS_OK on success, PA_STATUS_ERROR_OOM if memory is insufficient.
+int pa_compute_memory_budget(const PA_ModelDesc *desc, uint64_t available_bytes, PA_MemoryBudget *out_budget);
+
 #endif // PA_TYPES_H
