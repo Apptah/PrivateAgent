@@ -1,5 +1,6 @@
 import Testing
 import Foundation
+import FlashMoECore
 @testable import ModelPack
 
 @Suite("Manifest Parsing Tests")
@@ -29,6 +30,29 @@ struct ManifestParsingTests {
         #expect(types[0] == "gdn")
         #expect(types[3] == "full_attn")
         #expect(types[7] == "full_attn")
+    }
+
+    @Test("PAModelDescBridge produces valid PA_ModelDesc")
+    func bridgeProducesValidDesc() throws {
+        let manifest = try ModelManifest(modelDir: fixturesDir)
+        var desc = PAModelDescBridge.makeModelDesc(from: manifest)
+        #expect(pa_model_desc_validate(&desc) == PA_STATUS_OK.rawValue)
+        #expect(desc.num_layers == 60)
+        #expect(desc.hidden_dim == 2048)
+        #expect(desc.num_kv_heads == 2)
+        #expect(desc.vocab_size == 151936)
+        #expect(desc.num_experts == 128)
+        #expect(desc.active_experts_k == 8)
+        #expect(desc.expert_quant_bits == 4)
+        #expect(desc.default_key_bits_x2 == 7)
+    }
+
+    @Test("PAModelDescBridge sets layer types correctly")
+    func bridgeSetsLayerTypes() throws {
+        let manifest = try ModelManifest(modelDir: fixturesDir)
+        var desc = PAModelDescBridge.makeModelDesc(from: manifest)
+        #expect(pa_model_desc_full_attn_count(&desc) == 15)
+        #expect(pa_model_desc_gdn_count(&desc) == 45)
     }
 
     @Test("Missing config.json throws")
