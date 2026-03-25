@@ -1,0 +1,18 @@
+{
+    "manifest_version": 1,
+    "layer_types": null,
+    "expert_layout": {
+        "quant_bits": 4,
+        "dense_quant_bits": 4,
+        "expert_size_each": 7000000,
+        "expert_layers": 40
+    },
+    "turboquant_defaults": {
+        "key_bits_x2": 7,
+        "value_bits_x2": 7,
+        "block_size": 64,
+        "transform_kind": "structured_rotation",
+        "transform_seed": 42
+    },
+    "checksums": {}
+}
