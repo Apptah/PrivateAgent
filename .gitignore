@@ -1,0 +1,25 @@
+# Xcode
+*.xcodeproj/
+xcuserdata/
+DerivedData/
+build/
+*.pbxuser
+*.mode1v3
+*.mode2v3
+*.perspectivev3
+*.xcuserstate
+
+# SPM
+.build/
+.swiftpm/
+Package.resolved
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Models (downloaded, not committed)
+Models/
+*.bin
+*.safetensors
+*.gguf
