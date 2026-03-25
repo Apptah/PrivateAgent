@@ -101,5 +101,10 @@ let package = Package(
             name: "TurboQuantCoreTests",
             dependencies: ["TurboQuantCore"]
         ),
+        .testTarget(
+            name: "ModelPackTests",
+            dependencies: ["ModelPack"],
+            resources: [.copy("Fixtures")]
+        ),
     ]
 )
