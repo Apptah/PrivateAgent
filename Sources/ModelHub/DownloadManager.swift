@@ -43,12 +43,17 @@ public final class DownloadManager: NSObject, @unchecked Sendable {
 
     /// Download all files for a catalog entry sequentially.
     public func download(entry: CatalogEntry) async throws {
+        print("[DL] Starting download: \(entry.displayName) (\(entry.files.count) files, \(entry.totalSizeGB) GB)")
+
         guard try await checkFreeSpace(for: entry) else {
+            print("[DL] ❌ Insufficient disk space")
             throw DownloadError.insufficientDiskSpace
         }
+        print("[DL] ✅ Disk space OK")
 
         let storage = ModelStorage()
         let destDir = await storage.modelDir(for: entry.id)
+        print("[DL] Dest: \(destDir.path)")
         let fm = FileManager.default
         try fm.createDirectory(at: destDir, withIntermediateDirectories: true)
 
@@ -88,16 +93,23 @@ public final class DownloadManager: NSObject, @unchecked Sendable {
         progress.bytesDownloaded = completedBytes
         await updateProgress(entry.id, progress)
 
+        print("[DL] Files to download: \(filesToDownload.count), already done: \(progress.filesCompleted), completed bytes: \(completedBytes)")
+
         if filesToDownload.isEmpty {
+            print("[DL] ✅ All files already downloaded")
             progress.status = .complete
             await updateProgress(entry.id, progress)
             return
         }
 
         // Download each file sequentially
-        for file in filesToDownload {
-            guard await activeDownloads[entry.id]?.status == .downloading else { break }
+        for (fileIndex, file) in filesToDownload.enumerated() {
+            guard await activeDownloads[entry.id]?.status == .downloading else {
+                print("[DL] ⚠️ Download cancelled or status changed")
+                break
+            }
 
+            print("[DL] [\(fileIndex+1)/\(filesToDownload.count)] Downloading: \(file.filename) (\(file.sizeBytes) bytes)")
             progress.currentFile = file.filename
             await updateProgress(entry.id, progress)
 
@@ -132,13 +144,16 @@ public final class DownloadManager: NSObject, @unchecked Sendable {
                 completedBytes += actualSize
                 progress.filesCompleted += 1
                 progress.bytesDownloaded = completedBytes
+                print("[DL]   ✅ Saved \(file.filename) (\(actualSize) bytes) — \(progress.filesCompleted)/\(progress.filesTotal) done")
                 await updateProgress(entry.id, progress)
 
             } catch is CancellationError {
+                print("[DL] ⚠️ Cancelled")
                 progress.status = .paused
                 await updateProgress(entry.id, progress)
                 return
             } catch {
+                print("[DL] ❌ FAILED \(file.filename): \(error)")
                 progress.status = .failed
                 progress.currentFile = "\(file.filename): \(error.localizedDescription)"
                 await updateProgress(entry.id, progress)
@@ -192,36 +207,46 @@ public final class DownloadManager: NSObject, @unchecked Sendable {
                 let (tempURL, response): (URL, URLResponse)
 
                 if let data = resumeData {
-                    // Resume from where we left off
+                    print("[DL]   Attempt \(attempt+1)/\(maxRetries+1): RESUMING \(filename) (\(data.count) bytes resume data)")
                     (tempURL, response) = try await session.download(resumeFrom: data)
                 } else {
+                    print("[DL]   Attempt \(attempt+1)/\(maxRetries+1): \(url.host ?? "") \(filename)")
                     (tempURL, response) = try await session.download(for: request)
                 }
 
+                let code = (response as? HTTPURLResponse)?.statusCode ?? 0
+                print("[DL]   ✅ HTTP \(code) — downloaded to \(tempURL.lastPathComponent)")
+
                 guard let http = response as? HTTPURLResponse,
                       (200...299).contains(http.statusCode) else {
-                    let code = (response as? HTTPURLResponse)?.statusCode ?? 0
+                    print("[DL]   ❌ HTTP \(code) for \(filename)")
                     throw DownloadError.httpError(filename: filename, statusCode: code)
                 }
 
                 return tempURL
 
-            } catch let error as NSError where error.code == -1005 || error.code == -1001 || error.code == -1009 {
-                // -1005: connection lost, -1001: timeout, -1009: no internet
+            } catch let error as NSError where error.domain == NSURLErrorDomain &&
+                (error.code == -1005 || error.code == -1001 || error.code == -1009 || error.code == -1004) {
+                // -1005: connection lost, -1001: timeout, -1009: no internet, -1004: can't connect
                 lastError = error
+                print("[DL]   ⚠️ Network error \(error.code): \(error.localizedDescription)")
 
                 // Extract resume data if available
                 if let data = error.userInfo[NSURLSessionDownloadTaskResumeData] as? Data {
                     resumeData = data
+                    print("[DL]   📦 Got resume data: \(data.count) bytes")
                 }
 
                 if attempt < maxRetries {
-                    // Wait before retry: 2, 4, 8, 16, 32 seconds
                     let delay = UInt64(pow(2.0, Double(attempt + 1)))
+                    print("[DL]   ⏳ Retrying in \(delay)s...")
                     try await Task.sleep(for: .seconds(delay))
                     continue
+                } else {
+                    print("[DL]   ❌ All retries exhausted for \(filename)")
                 }
             } catch {
+                print("[DL]   ❌ Error: \(error)")
                 throw error
             }
         }
