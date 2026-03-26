@@ -103,9 +103,11 @@ int pa_session_load_model(PA_Session *session, const PA_ModelDesc *desc, uint64_
     fmConfig.temperature = 0.7f;  // Qwen3 recommended for non-thinking
     fmConfig.top_p = 0.8f;
     fmConfig.top_k = 20;
-    fmConfig.prefill_batch = 32;           // batch 32 tokens per layer during prefill
-    fmConfig.prefill_skip_experts = 0;     // keep experts on — skip_experts=1 degrades output quality
-    fmConfig.prefill_experts_full_only = 0; // disabled — causes pread failures on full attn layers
+    // Batched prefill requires skip_experts=1, but skipping experts degrades
+    // output quality (echo/garbage). Per-token prefill is slower but correct.
+    // TODO: modify engine batched path to support experts, then re-enable.
+    fmConfig.prefill_batch = 0;
+    fmConfig.prefill_skip_experts = 0;
     fmConfig.verbose = 0;
 
     int loadResult = flashmoe_load(ctx, &fmConfig);
