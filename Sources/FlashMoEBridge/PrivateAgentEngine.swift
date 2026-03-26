@@ -241,7 +241,6 @@ public final class PrivateAgentEngine {
             case .formattedPrompt(let text):
                 prompt = text
             case .tokenIDs(let ids):
-                // Encode as space-separated decimal IDs; runtime handles token-id prompts.
                 prompt = ids.map { String($0) }.joined(separator: " ")
             }
 
@@ -260,14 +259,15 @@ public final class PrivateAgentEngine {
                 }
             }
             let ctx = CallbackContext(continuation)
-            let rawCtx = Unmanaged.passRetained(ctx).toOpaque()
+
+            // nonisolated(unsafe) — these are opaque C pointers guarded by engineQueue,
+            // safe to capture in @Sendable closures.
+            nonisolated(unsafe) let sendableSession = s
+            nonisolated(unsafe) let sendableRawCtx = Unmanaged.passRetained(ctx).toOpaque()
 
             // Register cancellation *before* dispatching work.
-            continuation.onTermination = { [weak self] _ in
-                guard let self else { return }
-                if let s = self.session {
-                    pa_session_cancel(s)
-                }
+            continuation.onTermination = { _ in
+                pa_session_cancel(sendableSession)
             }
 
             self.engineQueue.async { [weak self] in
@@ -279,11 +279,11 @@ public final class PrivateAgentEngine {
                 }
 
                 var mutableConfig = cConfig
-                let result = pa_session_generate(s, prompt, &mutableConfig, tokenCallback, rawCtx)
+                let result = pa_session_generate(sendableSession, prompt, &mutableConfig, tokenCallback, sendableRawCtx)
 
                 // Collect stats regardless of result.
                 var rawStats = PA_GenerationStats()
-                pa_session_get_gen_stats(s, &rawStats)
+                pa_session_get_gen_stats(sendableSession, &rawStats)
                 let stats = GenerationStats(
                     tokensPerSecond: rawStats.tokens_per_second,
                     tokensGenerated: Int(rawStats.tokens_generated),
@@ -291,11 +291,11 @@ public final class PrivateAgentEngine {
                 )
 
                 // Release the retained context now that the C side is done.
-                Unmanaged<CallbackContext>.fromOpaque(rawCtx).release()
+                Unmanaged<CallbackContext>.fromOpaque(sendableRawCtx).release()
 
                 // Capture error string on engine queue before switching to main
                 let errorMsg: String? = (result != Int32(PA_STATUS_OK.rawValue))
-                    ? String(cString: pa_session_last_error(s))
+                    ? String(cString: pa_session_last_error(sendableSession))
                     : nil
 
                 DispatchQueue.main.async {

@@ -69,6 +69,7 @@ let package = Package(
                 .headerSearchPath("."),
                 .define("CHAT_MODE", to: "1"),
                 .define("ACCELERATE_NEW_LAPACK"),
+                .unsafeFlags(["-Wno-unused-function"], .when(platforms: [.iOS, .macOS])),
             ],
             linkerSettings: [
                 .linkedFramework("Metal"),

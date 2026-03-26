@@ -1430,7 +1430,7 @@ kernel void attn_softmax_batched(
     if (simd_group == 0 && simd_lane < num_simd_groups) {
         global_max = simd_max(shared_max[simd_lane]);
     }
-    threadgroup float broadcast_max;
+    threadgroup float broadcast_max = 0;
     if (lid == 0) broadcast_max = global_max;
     threadgroup_barrier(mem_flags::mem_threadgroup);
     global_max = broadcast_max;
@@ -1451,7 +1451,7 @@ kernel void attn_softmax_batched(
     if (simd_group == 0 && simd_lane < num_simd_groups) {
         global_sum = simd_sum(shared_sum[simd_lane]);
     }
-    threadgroup float broadcast_sum;
+    threadgroup float broadcast_sum = 0;
     if (lid == 0) broadcast_sum = global_sum;
     threadgroup_barrier(mem_flags::mem_threadgroup);
     global_sum = broadcast_sum;
@@ -1665,7 +1665,7 @@ kernel void rms_norm_qk(
     }
 
     // RMS norm for k
-    threadgroup float k_sum_sq;
+    threadgroup float k_sum_sq = 0;
     float kval = (tid < key_dim) ? k[base + tid] : 0;
     threadgroup float k_partial[128];
     k_partial[tid] = kval * kval;
@@ -2265,7 +2265,7 @@ kernel void prefill_rms_norm_bf16(
     if (simd_lane == 0) shared[simd_group] = simd_val;
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    threadgroup float sum_sq_broadcast;
+    threadgroup float sum_sq_broadcast = 0;
     if (simd_group == 0) {
         float val = (simd_lane < (tg_size + 31) / 32) ? shared[simd_lane] : 0.0f;
         val = simd_sum(val);
@@ -2320,7 +2320,7 @@ kernel void prefill_residual_norm_bf16(
     if (simd_lane == 0) shared[simd_group] = simd_val;
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    threadgroup float sum_sq_broadcast;
+    threadgroup float sum_sq_broadcast = 0;
     if (simd_group == 0) {
         float val = (simd_lane < (tg_size + 31) / 32) ? shared[simd_lane] : 0.0f;
         val = simd_sum(val);
