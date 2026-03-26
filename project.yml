@@ -21,6 +21,9 @@ targets:
     platform: iOS
     sources:
       - path: Apps/PrivateAgentiOS
+      - path: Vendor/flash-moe/shaders.metal
+        type: file
+        buildPhase: sources
     dependencies:
       - package: PrivateAgent
         product: PrivateAgentUI
