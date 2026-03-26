@@ -3,6 +3,7 @@ import SwiftData
 import Observation
 import FlashMoEBridge
 import ModelPack
+import ModelHub
 
 @MainActor
 @Observable
@@ -42,6 +43,44 @@ final class ChatViewModel {
     func sendMessage() {
         guard !inputText.isEmpty, !isGenerating else { return }
         guard let conversation else { return }
+
+        // Auto-load model if engine isn't ready
+        if engine.state == .idle {
+            Task {
+                await autoLoadModel()
+                // Retry send after load
+                if engine.state == .ready {
+                    sendMessageInternal(conversation: conversation)
+                }
+            }
+            return
+        }
+        if engine.state != .ready {
+            currentStats = "Engine state: \(engine.state)"
+            return
+        }
+
+        sendMessageInternal(conversation: conversation)
+    }
+
+    private func autoLoadModel() async {
+        let storage = ModelStorage()
+        let models = (try? await storage.listModels()) ?? []
+        guard let modelDir = models.first else {
+            currentStats = "No model downloaded. Go to Models to download one."
+            return
+        }
+        currentStats = "Loading model..."
+        do {
+            let manifest = try ModelManifest(modelDir: modelDir)
+            try await engine.loadModel(from: manifest)
+            currentStats = "Model loaded!"
+        } catch {
+            currentStats = "Load failed: \(error.localizedDescription)"
+        }
+    }
+
+    private func sendMessageInternal(conversation: Conversation) {
 
         let text = inputText
         inputText = ""
