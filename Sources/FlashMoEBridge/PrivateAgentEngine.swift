@@ -71,6 +71,26 @@ public struct ModelInfo: Sendable {
     public let kvCacheMB: Double
 }
 
+// MARK: - GenerationConfig
+
+public struct GenerationConfig: Sendable {
+    public var maxTokens: Int
+    public var temperature: Float
+    public var topP: Float
+    public var thinkBudget: Int
+
+    public static let `default` = GenerationConfig(
+        maxTokens: 2048, temperature: 0.7, topP: 0.9, thinkBudget: 0
+    )
+
+    public init(maxTokens: Int = 2048, temperature: Float = 0.7, topP: Float = 0.9, thinkBudget: Int = 0) {
+        self.maxTokens = maxTokens
+        self.temperature = temperature
+        self.topP = topP
+        self.thinkBudget = thinkBudget
+    }
+}
+
 // MARK: - EngineError
 
 public enum EngineError: LocalizedError, Sendable {
@@ -78,13 +98,15 @@ public enum EngineError: LocalizedError, Sendable {
     case destroyed
     case initFailed
     case loadFailed(String)
+    case generationFailed(String)
 
     public var errorDescription: String? {
         switch self {
-        case .busy:                return "Engine is busy"
-        case .destroyed:           return "Engine was destroyed"
-        case .initFailed:          return "Failed to initialize engine"
-        case .loadFailed(let msg): return "Load failed: \(msg)"
+        case .busy:                       return "Engine is busy"
+        case .destroyed:                  return "Engine was destroyed"
+        case .initFailed:                 return "Failed to initialize engine"
+        case .loadFailed(let msg):        return "Load failed: \(msg)"
+        case .generationFailed(let msg):  return "Generation failed: \(msg)"
         }
     }
 }
@@ -193,6 +215,115 @@ public final class PrivateAgentEngine {
         }
         modelInfo = nil
         state = .idle
+    }
+
+    /// Stream tokens from the model for the given prompt.
+    /// The returned `AsyncThrowingStream` emits `.token`, `.prefillProgress`, etc.
+    /// and terminates with `.finished` on success or a thrown `EngineError` on failure.
+    public func generate(
+        _ input: PromptInput,
+        config: GenerationConfig = .default
+    ) -> AsyncThrowingStream<GenerationEvent, Error> {
+        AsyncThrowingStream { continuation in
+            // Must be called on @MainActor, so state access is safe here.
+            guard self.state == .ready else {
+                continuation.finish(throwing: EngineError.busy)
+                return
+            }
+            guard let s = self.session else {
+                continuation.finish(throwing: EngineError.initFailed)
+                return
+            }
+            self.state = .generating
+
+            let prompt: String
+            switch input {
+            case .formattedPrompt(let text):
+                prompt = text
+            case .tokenIDs(let ids):
+                // Encode as space-separated decimal IDs; runtime handles token-id prompts.
+                prompt = ids.map { String($0) }.joined(separator: " ")
+            }
+
+            let cConfig = PA_GenerationConfig(
+                max_tokens:   Int32(config.maxTokens),
+                temperature:  config.temperature,
+                top_p:        config.topP,
+                think_budget: Int32(config.thinkBudget)
+            )
+
+            // Bridge: retain the continuation context so the C callback can reach it.
+            final class CallbackContext: @unchecked Sendable {
+                let continuation: AsyncThrowingStream<GenerationEvent, Error>.Continuation
+                init(_ c: AsyncThrowingStream<GenerationEvent, Error>.Continuation) {
+                    self.continuation = c
+                }
+            }
+            let ctx = CallbackContext(continuation)
+            let rawCtx = Unmanaged.passRetained(ctx).toOpaque()
+
+            // Register cancellation *before* dispatching work.
+            continuation.onTermination = { [weak self] _ in
+                guard let self else { return }
+                if let s = self.session {
+                    pa_session_cancel(s)
+                }
+            }
+
+            self.engineQueue.async { [weak self] in
+                let tokenCallback: PA_TokenCallback = { tokenText, tokenID, _, tps, userData in
+                    let ctx = Unmanaged<CallbackContext>.fromOpaque(userData!).takeUnretainedValue()
+                    let text = tokenText.map { String(cString: $0) } ?? ""
+                    ctx.continuation.yield(.token(text: text, id: Int(tokenID)))
+                    return 0  // 0 = continue
+                }
+
+                var mutableConfig = cConfig
+                let result = pa_session_generate(s, prompt, &mutableConfig, tokenCallback, rawCtx)
+
+                // Collect stats regardless of result.
+                var rawStats = PA_GenerationStats()
+                pa_session_get_gen_stats(s, &rawStats)
+                let stats = GenerationStats(
+                    tokensPerSecond: rawStats.tokens_per_second,
+                    tokensGenerated: Int(rawStats.tokens_generated),
+                    ttftMs: rawStats.ttft_ms
+                )
+
+                // Release the retained context now that the C side is done.
+                Unmanaged<CallbackContext>.fromOpaque(rawCtx).release()
+
+                DispatchQueue.main.async {
+                    guard let self else { return }
+                    if result == Int32(PA_STATUS_OK.rawValue) {
+                        self.state = .ready
+                        continuation.yield(.finished(stats: stats))
+                        continuation.finish()
+                    } else {
+                        let errorMsg = String(cString: pa_session_last_error(s))
+                        self.state = .error(errorMsg)
+                        self.lastError = errorMsg
+                        continuation.finish(throwing: EngineError.generationFailed(errorMsg))
+                    }
+                }
+            }
+        }
+    }
+
+    /// Cancel any in-progress generation.
+    public func cancel() {
+        guard let s = session else { return }
+        engineQueue.async {
+            pa_session_cancel(s)
+        }
+    }
+
+    /// Reset multi-turn conversation state (clears KV-cache history).
+    public func resetConversation() {
+        guard let s = session else { return }
+        engineQueue.sync {
+            pa_session_reset(s)
+        }
     }
 
     private var isErrorState: Bool {
