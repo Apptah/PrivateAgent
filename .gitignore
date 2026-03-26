@@ -23,3 +23,4 @@ Models/
 *.bin
 *.safetensors
 *.gguf
+.claude/
