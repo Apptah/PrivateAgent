@@ -13,7 +13,6 @@ public actor ModelCatalog {
 
     public private(set) var entries: [CatalogEntry] = ModelCatalog.bundledCatalog
 
-    /// Placeholder for future remote catalog fetch.
     public func refresh() async throws {
         // TODO: fetch from remote catalog endpoint and merge with bundled entries
     }
@@ -33,72 +32,74 @@ public actor ModelCatalog {
         makeTieredEntry(),
     ]
 
-    // MARK: Helpers
-
-    private static func configFiles() -> [ModelFile] {
-        [
-            ModelFile(filename: "config.json",         sizeBytes: 4_096),
-            ModelFile(filename: "model_weights.json",  sizeBytes: 512_000),
-            ModelFile(filename: "model_weights.bin",   sizeBytes: 0),    // placeholder; actual size in entry total
-            ModelFile(filename: "vocab.bin",           sizeBytes: 2_097_152),
-            ModelFile(filename: "tokenizer.json",      sizeBytes: 1_048_576),
-            ModelFile(filename: "tokenizer.bin",       sizeBytes: 1_048_576),
-        ]
-    }
-
-    private static func expertFiles(count: Int, bytesEach: UInt64) -> [ModelFile] {
-        (0 ..< count).map { layer in
-            ModelFile(
-                filename: String(format: "expert_%03d.bin", layer),
-                sizeBytes: bytesEach
-            )
-        }
-    }
-
     // MARK: Entry Factories
 
-    /// Q4 quantisation — 19.5 GB total, 40 expert layers @ 452 MB each
+    /// Full Q4 — ~19.5 GB, all experts at 4-bit
     private static func makeQ4Entry() -> CatalogEntry {
-        let expertSizeBytes: UInt64 = 452 * 1_048_576    // 452 MB
-        let expertLayerCount = 40
-
-        var files = configFiles()
-        files += expertFiles(count: expertLayerCount, bytesEach: expertSizeBytes)
-
-        // Total: 19.5 GB
-        let totalSizeBytes: UInt64 = 19_947_524_096      // ≈ 19.5 GiB
+        var files: [ModelFile] = [
+            ModelFile(filename: "config.json", sizeBytes: 3_809),
+            ModelFile(filename: "model_weights.json", sizeBytes: 251_539),
+            ModelFile(filename: "model_weights.bin", sizeBytes: 1_378_869_376),
+            ModelFile(filename: "vocab.bin", sizeBytes: 3_360_287),
+            ModelFile(filename: "tokenizer.json", sizeBytes: 19_989_343),
+            ModelFile(filename: "tokenizer.bin", sizeBytes: 8_201_040),
+        ]
+        for i in 0..<40 {
+            files.append(ModelFile(
+                filename: String(format: "packed_experts/layer_%02d.bin", i),
+                sizeBytes: 452_984_832
+            ))
+        }
 
         return CatalogEntry(
             id: "qwen3.5-35b-a3b-q4",
-            displayName: "Qwen 3.5 35B-A3B (Q4)",
-            repoId: "Qwen/Qwen3.5-35B-A3B-Q4_K_M-GGUF",
-            description: "Qwen 3.5 35B MoE model with Q4_K_M quantisation. 40 expert layers at 452 MB each. Best quality/size tradeoff.",
-            totalSizeBytes: totalSizeBytes,
-            quantization: "Q4_K_M",
-            expertLayers: expertLayerCount,
+            displayName: "Qwen 3.5 35B-A3B",
+            repoId: "alexintosh/Qwen3.5-35B-A3B-Q4-FlashMoE",
+            description: "Full 4-bit quantization. Best quality. ~19.5 GB.",
+            totalSizeBytes: 19_500_000_000,
+            quantization: "4-bit",
+            expertLayers: 40,
             files: files
         )
     }
 
-    /// Tiered quantisation — 13.4 GB total, 40 expert layers @ 300 MB each
+    /// Tiered — ~13.4 GB, hot experts 4-bit, cold experts 2-bit
     private static func makeTieredEntry() -> CatalogEntry {
-        let expertSizeBytes: UInt64 = 300 * 1_048_576    // 300 MB
-        let expertLayerCount = 40
-
-        var files = configFiles()
-        files += expertFiles(count: expertLayerCount, bytesEach: expertSizeBytes)
-
-        // Total: 13.4 GB
-        let totalSizeBytes: UInt64 = 14_390_108_160      // ≈ 13.4 GiB
+        var files: [ModelFile] = [
+            ModelFile(filename: "config.json", sizeBytes: 3_809),
+            ModelFile(filename: "model_weights.json", sizeBytes: 251_539),
+            ModelFile(filename: "model_weights.bin", sizeBytes: 1_378_869_376),
+            ModelFile(filename: "vocab.bin", sizeBytes: 3_360_287),
+            ModelFile(filename: "tokenizer.json", sizeBytes: 19_989_343),
+            ModelFile(filename: "tokenizer.bin", sizeBytes: 8_201_040),
+            ModelFile(filename: "packed_experts_tiered/tiered_manifest.json", sizeBytes: 1_005_120),
+        ]
+        // Variable-size tiered layers (from flash-moe iOS port)
+        let layerSizes: [UInt64] = [
+            337_379_328, 349_175_808, 342_097_920, 331_087_872, 320_077_824,
+            301_989_888, 301_989_888, 289_406_976, 285_474_816, 294_125_568,
+            305_922_048, 306_708_480, 297_271_296, 293_339_136, 282_329_088,
+            288_620_544, 287_834_112, 292_552_704, 280_756_224, 287_834_112,
+            282_329_088, 283_115_520, 301_989_888, 305_135_616, 294_125_568,
+            294_125_568, 281_542_656, 292_552_704, 296_484_864, 298_844_160,
+            289_406_976, 291_766_272, 301_989_888, 302_776_320, 305_135_616,
+            300_417_024, 298_057_728, 304_349_184, 301_989_888, 309_854_208,
+        ]
+        for (i, size) in layerSizes.enumerated() {
+            files.append(ModelFile(
+                filename: String(format: "packed_experts_tiered/layer_%02d.bin", i),
+                sizeBytes: size
+            ))
+        }
 
         return CatalogEntry(
             id: "qwen3.5-35b-a3b-tiered",
-            displayName: "Qwen 3.5 35B-A3B (Tiered)",
-            repoId: "Qwen/Qwen3.5-35B-A3B-Tiered-GGUF",
-            description: "Qwen 3.5 35B MoE model with tiered quantisation. 40 expert layers at 300 MB each. Smaller footprint for memory-constrained devices.",
-            totalSizeBytes: totalSizeBytes,
-            quantization: "Tiered",
-            expertLayers: expertLayerCount,
+            displayName: "Qwen 3.5 35B-A3B Tiered",
+            repoId: "alexintosh/Qwen3.5-35B-A3B-Q4-Tiered-FlashMoE",
+            description: "Tiered: hot experts 4-bit, cold 2-bit. Faster on iPhone. ~13.4 GB.",
+            totalSizeBytes: 13_424_643_082,
+            quantization: "Tiered (4-bit/2-bit)",
+            expertLayers: 40,
             files: files
         )
     }

@@ -26,7 +26,7 @@ struct CatalogTests {
     func lookupById() async {
         let entry = await ModelCatalog.shared.entry(id: "qwen3.5-35b-a3b-q4")
         #expect(entry != nil)
-        #expect(entry?.displayName.contains("Q4") == true)
+        #expect(entry?.displayName.contains("35B") == true)
     }
 
     @Test("Missing id returns nil")
