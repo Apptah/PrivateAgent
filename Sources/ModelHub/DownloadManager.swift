@@ -58,7 +58,17 @@ public final class DownloadManager: NSObject {
 
         let storage = ModelStorage()
         let destDir = await storage.modelDir(for: entry.id)
-        try FileManager.default.createDirectory(at: destDir, withIntermediateDirectories: true)
+        let fm = FileManager.default
+        try fm.createDirectory(at: destDir, withIntermediateDirectories: true)
+
+        // Pre-create subdirectories for expert files (e.g. packed_experts/, packed_experts_tiered/)
+        for file in entry.files {
+            let fileURL = destDir.appendingPathComponent(file.filename)
+            let parentDir = fileURL.deletingLastPathComponent()
+            if parentDir != destDir && !fm.fileExists(atPath: parentDir.path) {
+                try fm.createDirectory(at: parentDir, withIntermediateDirectories: true)
+            }
+        }
 
         var progress = DownloadProgress(
             catalogId: entry.id,

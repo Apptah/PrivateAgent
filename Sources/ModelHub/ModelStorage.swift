@@ -88,10 +88,16 @@ public actor ModelStorage {
 
     /// Available disk space on the volume containing storageDir, in bytes.
     public func availableSpaceBytes() throws -> UInt64 {
-        try ensureStorageDirExists()
-        let attrs = try FileManager.default.attributesOfFileSystem(
-            forPath: storageDir.path
-        )
+        // Use a path that's guaranteed to exist for attributesOfFileSystem.
+        // storageDir might not exist yet on first launch.
+        let queryPath: String
+        if FileManager.default.fileExists(atPath: storageDir.path) {
+            queryPath = storageDir.path
+        } else {
+            // Fall back to home directory (always accessible in sandbox)
+            queryPath = NSHomeDirectory()
+        }
+        let attrs = try FileManager.default.attributesOfFileSystem(forPath: queryPath)
         return (attrs[.systemFreeSize] as? UInt64) ?? 0
     }
 
