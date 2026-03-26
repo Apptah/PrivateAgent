@@ -44,6 +44,9 @@ typedef struct {
     int prefill_experts_full_only; // 1 = load routed experts only at full attention layers during prefill
     int prefill_batched_linear; // 1 = batch linear attention layers during prefill (0 = per-token fallback)
     int verbose;                // 1 = log to stderr, 0 = quiet
+    float temperature;          // Sampling temperature (0 = greedy, default 0.7)
+    float top_p;                // Nucleus sampling threshold (default 0.9)
+    int top_k;                  // Top-k sampling (0 = disabled, default 20)
 } FlashMoEConfig;
 
 // ---- Engine stats ----

@@ -100,6 +100,9 @@ int pa_session_load_model(PA_Session *session, const PA_ModelDesc *desc, uint64_
     fmConfig.model_path = desc->model_dir;
     fmConfig.max_context = (int)session->memory_budget.max_context_length;
     fmConfig.think_budget = 512;  // limit thinking tokens to prevent loops
+    fmConfig.temperature = 0.7f;  // Qwen3 recommended for non-thinking
+    fmConfig.top_p = 0.8f;
+    fmConfig.top_k = 20;
     fmConfig.verbose = 0;
 
     int loadResult = flashmoe_load(ctx, &fmConfig);

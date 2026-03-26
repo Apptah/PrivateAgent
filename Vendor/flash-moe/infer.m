@@ -493,6 +493,9 @@ static int g_layer_is_q3_outlier[MAX_LAYERS];
 static int g_cache_telemetry_enabled = 0;  // enabled by --cache-telemetry flag
 static int g_cache_io_split = 1;  // enabled by --cache-io-split N: split each routed expert pread into N page-aligned chunks
 static int g_think_budget = 2048; // max thinking tokens before force-emitting </think>
+static float g_temperature = 0.7f;  // sampling temperature (0 = greedy)
+static float g_top_p = 0.9f;        // nucleus sampling threshold
+static int g_top_k = 20;            // top-k sampling (0 = disabled)
 static int g_stream_mode = 0;    // --stream: clean output only, no progress/stats
 static int g_nax_disabled = 1;   // NAX disabled by default (slower for M=1 decode); --nax to enable
 
@@ -2646,6 +2649,79 @@ static int cpu_argmax(const float *x, int dim) {
         }
     }
     return best;
+}
+
+// Comparator for sampling: sort (idx, val) pairs descending by val
+typedef struct { int idx; float val; } IndexedLogit;
+static int cmp_indexed_logit_desc(const void *a, const void *b) {
+    float va = ((const IndexedLogit *)a)->val;
+    float vb = ((const IndexedLogit *)b)->val;
+    return (vb > va) ? 1 : (vb < va) ? -1 : 0;
+}
+
+// Temperature + top-k + top-p (nucleus) sampling
+// Operates on raw logits (pre-softmax). Returns sampled token ID.
+static int cpu_sample(const float *logits, int dim, float temperature, int top_k, float top_p) {
+    // Greedy fallback
+    if (temperature <= 0.0f) return cpu_argmax(logits, dim);
+
+    // Build (index, logit) pairs
+    IndexedLogit *candidates = (IndexedLogit *)malloc(dim * sizeof(IndexedLogit));
+    for (int i = 0; i < dim; i++) {
+        candidates[i].idx = i;
+        candidates[i].val = logits[i] / temperature;
+    }
+
+    // Sort descending by logit value
+    qsort(candidates, dim, sizeof(IndexedLogit), cmp_indexed_logit_desc);
+
+    // Apply top-k: limit candidates
+    int n = (top_k > 0 && top_k < dim) ? top_k : dim;
+
+    // Softmax over top-k candidates
+    float max_val = candidates[0].val;
+    float sum = 0.0f;
+    for (int i = 0; i < n; i++) {
+        candidates[i].val = expf(candidates[i].val - max_val);
+        sum += candidates[i].val;
+    }
+    for (int i = 0; i < n; i++) {
+        candidates[i].val /= sum;
+    }
+
+    // Apply top-p: find nucleus
+    if (top_p > 0.0f && top_p < 1.0f) {
+        float cumsum = 0.0f;
+        int cutoff = n;
+        for (int i = 0; i < n; i++) {
+            cumsum += candidates[i].val;
+            if (cumsum >= top_p) {
+                cutoff = i + 1;
+                break;
+            }
+        }
+        n = cutoff;
+
+        // Renormalize after top-p cut
+        sum = 0.0f;
+        for (int i = 0; i < n; i++) sum += candidates[i].val;
+        for (int i = 0; i < n; i++) candidates[i].val /= sum;
+    }
+
+    // Sample from the distribution
+    float r = (float)arc4random() / (float)UINT32_MAX;
+    float cumsum = 0.0f;
+    int result = candidates[0].idx;  // fallback
+    for (int i = 0; i < n; i++) {
+        cumsum += candidates[i].val;
+        if (r <= cumsum) {
+            result = candidates[i].idx;
+            break;
+        }
+    }
+
+    free(candidates);
+    return result;
 }
 
 // SiLU activation

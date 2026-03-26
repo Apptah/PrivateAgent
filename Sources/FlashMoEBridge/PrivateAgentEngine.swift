@@ -80,7 +80,7 @@ public struct GenerationConfig: Sendable {
     public var thinkBudget: Int
 
     public static let `default` = GenerationConfig(
-        maxTokens: 2048, temperature: 0.7, topP: 0.9, thinkBudget: 0
+        maxTokens: 2048, temperature: 0.7, topP: 0.8, thinkBudget: 0
     )
 
     public init(maxTokens: Int = 2048, temperature: Float = 0.7, topP: Float = 0.9, thinkBudget: Int = 0) {

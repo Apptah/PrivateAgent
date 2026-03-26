@@ -162,6 +162,15 @@ int flashmoe_load(FlashMoEContext *ctx, const FlashMoEConfig *config) {
         if (config->think_budget > 0) {
             g_think_budget = config->think_budget;
         }
+        if (config->temperature > 0.0f) {
+            g_temperature = config->temperature;
+        }
+        if (config->top_p > 0.0f) {
+            g_top_p = config->top_p;
+        }
+        if (config->top_k > 0) {
+            g_top_k = config->top_k;
+        }
 
         // Set quantization mode
         g_use_tiered = config->use_tiered;
@@ -791,7 +800,7 @@ int flashmoe_generate(
         }
 
         lm_head_forward(ctx->wf, ctx->hidden, ctx->logits);
-        int next_token = cpu_argmax(ctx->logits, VOCAB_SIZE);
+        int next_token = cpu_sample(ctx->logits, VOCAB_SIZE, g_temperature, g_top_k, g_top_p);
 
         ctx->ttft_ms = now_ms() - t0;
         ctx->tokens_generated = 1;
@@ -857,7 +866,7 @@ int flashmoe_generate(
             }
 
             lm_head_forward(ctx->wf, ctx->hidden, ctx->logits);
-            next_token = cpu_argmax(ctx->logits, VOCAB_SIZE);
+            next_token = cpu_sample(ctx->logits, VOCAB_SIZE, g_temperature, g_top_k, g_top_p);
 
             if (g_timing_enabled) {
                 g_timing.lm_head += now_ms() - t_lm;
@@ -1034,7 +1043,7 @@ int flashmoe_generate_continuation(
         }
 
         lm_head_forward(ctx->wf, ctx->hidden, ctx->logits);
-        int next_token = cpu_argmax(ctx->logits, VOCAB_SIZE);
+        int next_token = cpu_sample(ctx->logits, VOCAB_SIZE, g_temperature, g_top_k, g_top_p);
 
         ctx->ttft_ms = now_ms() - t0;
         ctx->tokens_generated = 1;
@@ -1090,7 +1099,7 @@ int flashmoe_generate_continuation(
             }
 
             lm_head_forward(ctx->wf, ctx->hidden, ctx->logits);
-            next_token = cpu_argmax(ctx->logits, VOCAB_SIZE);
+            next_token = cpu_sample(ctx->logits, VOCAB_SIZE, g_temperature, g_top_k, g_top_p);
 
             if (g_timing_enabled) {
                 g_timing.lm_head += now_ms() - t_lm2;
