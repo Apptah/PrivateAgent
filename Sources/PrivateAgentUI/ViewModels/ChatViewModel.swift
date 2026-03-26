@@ -89,6 +89,8 @@ final class ChatViewModel {
             guard let self else { return }
             var accumulated = ""
             var inThinking = false
+            var tokenCount = 0
+            let genStartTime = Date()
 
             do {
                 for try await event in stream {
@@ -98,6 +100,14 @@ final class ChatViewModel {
                     case .token(let text, _):
                         accumulated += text
                         self.streamingText = accumulated
+                        tokenCount += 1
+
+                        // Update live tok/s every token
+                        let elapsed = Date().timeIntervalSince(genStartTime)
+                        if elapsed > 0.1 {
+                            let tps = Double(tokenCount) / elapsed
+                            self.currentStats = String(format: "%d tokens • %.1f tok/s", tokenCount, tps)
+                        }
 
                         // Batch-write to SwiftData every 500ms
                         let now = Date()
@@ -125,8 +135,16 @@ final class ChatViewModel {
 
                     case .finished(let stats):
                         assistantMessage.content = accumulated
-                        if stats.tokensPerSecond > 0 {
-                            self.currentStats = String(format: "%.1f tok/s", stats.tokensPerSecond)
+                        let finalTps = stats.tokensPerSecond > 0
+                            ? stats.tokensPerSecond
+                            : (Date().timeIntervalSince(genStartTime) > 0
+                               ? Double(tokenCount) / Date().timeIntervalSince(genStartTime)
+                               : 0)
+                        if finalTps > 0 {
+                            self.currentStats = String(format: "%d tokens • %.1f tok/s • TTFT %.0fms",
+                                                       stats.tokensGenerated > 0 ? stats.tokensGenerated : tokenCount,
+                                                       finalTps,
+                                                       stats.ttftMs)
                         }
                         conversation.updatedAt = Date()
                         try? self.modelContext.save()
