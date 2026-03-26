@@ -26,6 +26,8 @@ final class ChatViewModel {
         self.modelContext = modelContext
         self.engine = engine
         loadConversation()
+        // Reset KV cache — this conversation may differ from whatever was cached
+        engine.resetConversation()
     }
 
     private func loadConversation() {
@@ -116,25 +118,32 @@ final class ChatViewModel {
 
         try? modelContext.save()
 
-        // 4. Compile prompt from conversation history
-        let systemPrompt = conversation.systemPrompt
-        let history = sortedMessages
-            .filter { $0.id != assistantMessage.id }
-            .map { ChatMessage(role: $0.role.rawValue, content: $0.content) }
-
-        var chatMessages: [ChatMessage] = [
-            ChatMessage(role: "system", content: systemPrompt)
-        ]
-        chatMessages.append(contentsOf: history)
-        let prompt = PromptCompiler.compile(messages: chatMessages, addGenerationPrompt: true)
-
-        // 5. Stream generation
+        // 4. Choose full generate vs continuation
+        //    Turn 0 (first message): full prompt with system + history
+        //    Turn 1+: continuation with just the new user text (reuses KV cache)
         isGenerating = true
         streamingText = ""
         currentStats = ""
         lastBatchTime = Date()
 
-        let stream = engine.generate(.formattedPrompt(prompt))
+        let stream: AsyncThrowingStream<GenerationEvent, Error>
+        if engine.turnCount > 0 {
+            print("[CHAT] Using continuation (turn \(engine.turnCount)), user text only")
+            stream = engine.generateContinuation(text)
+        } else {
+            print("[CHAT] Using full generate (turn 0), compiling full prompt")
+            let systemPrompt = conversation.systemPrompt
+            let history = sortedMessages
+                .filter { $0.id != assistantMessage.id }
+                .map { ChatMessage(role: $0.role.rawValue, content: $0.content) }
+
+            var chatMessages: [ChatMessage] = [
+                ChatMessage(role: "system", content: systemPrompt)
+            ]
+            chatMessages.append(contentsOf: history)
+            let prompt = PromptCompiler.compile(messages: chatMessages, addGenerationPrompt: true)
+            stream = engine.generate(.formattedPrompt(prompt))
+        }
 
         generationTask = Task { [weak self] in
             guard let self else { return }

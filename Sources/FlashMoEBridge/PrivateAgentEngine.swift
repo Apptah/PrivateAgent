@@ -339,6 +339,100 @@ public final class PrivateAgentEngine {
         engineQueue.sync {
             pa_session_reset(s)
         }
+        print("[ENGINE] conversation reset, turn_count=0")
+    }
+
+    /// Current turn count (0 = no history, >0 = can use continuation).
+    public var turnCount: Int {
+        guard let s = session else { return 0 }
+        return Int(pa_session_turn_count(s))
+    }
+
+    /// Stream tokens for a continuation turn (reuses KV cache from previous turns).
+    /// Only sends the new user message text, NOT the full formatted prompt.
+    public func generateContinuation(
+        _ userMessage: String,
+        config: GenerationConfig = .default
+    ) -> AsyncThrowingStream<GenerationEvent, Error> {
+        AsyncThrowingStream { continuation in
+            guard self.state == .ready else {
+                continuation.finish(throwing: EngineError.busy)
+                return
+            }
+            guard let s = self.session else {
+                continuation.finish(throwing: EngineError.initFailed)
+                return
+            }
+            self.state = .generating
+
+            let cConfig = PA_GenerationConfig(
+                max_tokens:   Int32(config.maxTokens),
+                temperature:  config.temperature,
+                top_p:        config.topP,
+                think_budget: Int32(config.thinkBudget)
+            )
+
+            final class CallbackContext: @unchecked Sendable {
+                let continuation: AsyncThrowingStream<GenerationEvent, Error>.Continuation
+                init(_ c: AsyncThrowingStream<GenerationEvent, Error>.Continuation) {
+                    self.continuation = c
+                }
+            }
+            let ctx = CallbackContext(continuation)
+
+            nonisolated(unsafe) let sendableSession = s
+            nonisolated(unsafe) let sendableRawCtx = Unmanaged.passRetained(ctx).toOpaque()
+
+            continuation.onTermination = { @Sendable _ in
+                print("[ENGINE] continuation stream terminated, calling pa_session_cancel")
+                pa_session_cancel(sendableSession)
+            }
+
+            self.engineQueue.async { [weak self] in
+                let tokenCallback: PA_TokenCallback = { tokenText, tokenID, _, tps, userData in
+                    let ctx = Unmanaged<CallbackContext>.fromOpaque(userData!).takeUnretainedValue()
+                    let text = tokenText.map { String(cString: $0) } ?? ""
+                    ctx.continuation.yield(.token(text: text, id: Int(tokenID)))
+                    return 0
+                }
+
+                var mutableConfig = cConfig
+                print("[ENGINE] generate_continuation called")
+                let result = pa_session_generate_continuation(sendableSession, userMessage, &mutableConfig, tokenCallback, sendableRawCtx)
+                print("[ENGINE] generate_continuation returned \(result) (0=OK, -11=CANCELLED)")
+
+                var rawStats = PA_GenerationStats()
+                pa_session_get_gen_stats(sendableSession, &rawStats)
+                let stats = GenerationStats(
+                    tokensPerSecond: rawStats.tokens_per_second,
+                    tokensGenerated: Int(rawStats.tokens_generated),
+                    ttftMs: rawStats.ttft_ms
+                )
+
+                Unmanaged<CallbackContext>.fromOpaque(sendableRawCtx).release()
+
+                let wasCancelled = (result == Int32(PA_STATUS_CANCELLED.rawValue))
+                let errorMsg: String? = (!wasCancelled && result != Int32(PA_STATUS_OK.rawValue))
+                    ? String(cString: pa_session_last_error(sendableSession))
+                    : nil
+
+                DispatchQueue.main.async {
+                    guard let self else { return }
+                    if wasCancelled {
+                        self.state = .ready
+                        continuation.finish()
+                    } else if let errorMsg {
+                        self.state = .error(errorMsg)
+                        self.lastError = errorMsg
+                        continuation.finish(throwing: EngineError.generationFailed(errorMsg))
+                    } else {
+                        self.state = .ready
+                        continuation.yield(.finished(stats: stats))
+                        continuation.finish()
+                    }
+                }
+            }
+        }
     }
 
     private var isErrorState: Bool {
