@@ -106,5 +106,10 @@ let package = Package(
             dependencies: ["ModelPack"],
             resources: [.copy("Fixtures")]
         ),
+        .testTarget(
+            name: "FlashMoEBridgeTests",
+            dependencies: ["FlashMoEBridge", "ModelPack"],
+            resources: [.copy("Fixtures")]
+        ),
     ]
 )
