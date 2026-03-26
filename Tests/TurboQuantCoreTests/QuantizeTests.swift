@@ -19,7 +19,7 @@ private func lloydmaxRoundtrip(input: [Float], bits: UInt8) -> [Float] {
     return output
 }
 
-@Suite("TurboQuant Lloyd-Max Quantize Tests")
+@Suite("TurboQuant Lloyd-Max Quantize Tests", .serialized)
 struct QuantizeTests {
 
     // Unit-norm vector whose rotated coordinates are approximately N(0,1/d).

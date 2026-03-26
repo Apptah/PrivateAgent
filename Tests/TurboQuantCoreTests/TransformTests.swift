@@ -6,10 +6,10 @@ private func l2norm(_ v: [Float]) -> Float {
     sqrt(v.reduce(0.0) { $0 + $1 * $1 })
 }
 
-@Suite("Random Orthogonal Rotation Tests")
+@Suite("Random Orthogonal Rotation Tests", .serialized)
 struct TransformTests {
 
-    let dim: UInt32 = 64     // smaller dim for QR speed in tests
+    let dim: UInt32 = 32     // unique dim to avoid cross-suite global state contention
     let seed: UInt64 = 0xDEAD_BEEF_CAFE_1234
 
     private func makeVector(dim: UInt32, offset: Float = 0.0) -> [Float] {
@@ -56,19 +56,14 @@ struct TransformTests {
 
     @Test("rotation preserves L2 norm")
     func rotationPreservesNorm() {
-        tq_rotation_init(dim, seed)
+        // Use tq_rotate_inplace which atomically inits + rotates under mutex
         let x = makeVector(dim: dim)
-        var y = [Float](repeating: 0, count: Int(dim))
-        x.withUnsafeBufferPointer { xb in
-            y.withUnsafeMutableBufferPointer { yb in
-                tq_rotate(xb.baseAddress, yb.baseAddress, dim)
-            }
-        }
+        var y = x  // copy
+        tq_rotate_inplace(&y, dim, seed)
         let normBefore = l2norm(x)
         let normAfter  = l2norm(y)
         #expect(abs(normAfter - normBefore) < 1e-3,
                 "Norm before: \(normBefore), after: \(normAfter)")
-        tq_rotation_cleanup()
     }
 
     // MARK: - Determinism

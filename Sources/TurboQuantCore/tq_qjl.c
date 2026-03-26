@@ -2,6 +2,7 @@
 #include <stdlib.h>
 #include <math.h>
 #include <string.h>
+#include <pthread.h>
 
 // ── Cached QJL projection matrix S (d×d, N(0,1), row-major) ──────────────────
 // Row-major: S[i*dim + j]
@@ -10,6 +11,7 @@
 
 static float    *g_qjl_matrix = NULL;
 static uint32_t  g_qjl_dim    = 0;
+static pthread_mutex_t g_qjl_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 // ── splitmix64 + Box-Muller (local copies to avoid symbol conflict) ────────────
 
@@ -29,23 +31,33 @@ static float qjl_randn(uint64_t *state) {
 // ── Init / cleanup ────────────────────────────────────────────────────────────
 
 int tq_qjl_init(uint32_t dim, uint64_t seed) {
-    tq_qjl_cleanup();
+    pthread_mutex_lock(&g_qjl_mutex);
+    free(g_qjl_matrix);
+    g_qjl_matrix = NULL;
+    g_qjl_dim = 0;
+
     size_t n = (size_t)dim * dim;
     g_qjl_matrix = malloc(n * sizeof(float));
-    if (!g_qjl_matrix) return -1;
+    if (!g_qjl_matrix) {
+        pthread_mutex_unlock(&g_qjl_mutex);
+        return -1;
+    }
 
     uint64_t state = seed;
     for (size_t i = 0; i < n; i++) {
         g_qjl_matrix[i] = qjl_randn(&state);
     }
     g_qjl_dim = dim;
+    pthread_mutex_unlock(&g_qjl_mutex);
     return 0;
 }
 
 void tq_qjl_cleanup(void) {
+    pthread_mutex_lock(&g_qjl_mutex);
     free(g_qjl_matrix);
     g_qjl_matrix = NULL;
     g_qjl_dim    = 0;
+    pthread_mutex_unlock(&g_qjl_mutex);
 }
 
 // ── Encode: qjl_bits = sign(S @ residual) ────────────────────────────────────
@@ -60,15 +72,22 @@ void tq_qjl_encode(const float *residual, uint32_t dim,
     float norm = sqrtf(norm2);
     if (residual_norm_out) *residual_norm_out = norm;
 
+    pthread_mutex_lock(&g_qjl_mutex);
+
     // Ensure QJL matrix is ready (lazy init with a fixed seed if caller forgot)
     if (!g_qjl_matrix || dim != g_qjl_dim) {
+        pthread_mutex_unlock(&g_qjl_mutex);
         tq_qjl_init(dim, 0xDEADBEEFCAFEBABEULL);
+        pthread_mutex_lock(&g_qjl_mutex);
     }
 
     uint32_t num_bytes = (dim + 7) / 8;
     memset(qjl_bits, 0, num_bytes);
 
-    if (!g_qjl_matrix) return;
+    if (!g_qjl_matrix) {
+        pthread_mutex_unlock(&g_qjl_mutex);
+        return;
+    }
 
     // Project: proj[i] = S[i,:] · residual;  store sign bit
     for (uint32_t i = 0; i < dim; i++) {
@@ -81,13 +100,19 @@ void tq_qjl_encode(const float *residual, uint32_t dim,
             qjl_bits[i / 8] |= (uint8_t)(1u << (i % 8));
         }
     }
+    pthread_mutex_unlock(&g_qjl_mutex);
 }
 
 // ── Decode: output = (sqrt(π/2) / d) * γ * S^T @ sign_bits ──────────────────
 
 void tq_qjl_decode(const uint8_t *qjl_bits, float gamma,
                     float *output, uint32_t dim) {
-    if (!qjl_bits || !output || !g_qjl_matrix || g_qjl_dim != dim || dim == 0) return;
+    if (!qjl_bits || !output || dim == 0) return;
+    pthread_mutex_lock(&g_qjl_mutex);
+    if (!g_qjl_matrix || g_qjl_dim != dim) {
+        pthread_mutex_unlock(&g_qjl_mutex);
+        return;
+    }
 
     // Coefficient from paper: sqrt(π/2) / d
     float coeff = sqrtf((float)M_PI / 2.0f) / (float)dim * gamma;
@@ -102,6 +127,7 @@ void tq_qjl_decode(const uint8_t *qjl_bits, float gamma,
         }
         output[j] = coeff * sum;
     }
+    pthread_mutex_unlock(&g_qjl_mutex);
 }
 
 // ── Deprecated no-op ──────────────────────────────────────────────────────────
