@@ -3024,7 +3024,7 @@ static MetalCtx *metal_setup(void) {
 
     // ---- NAX (Metal 4 / M5+) ----
     ctx->has_nax = 0;
-    if (@available(macOS 26.2, *)) {
+    if (@available(macOS 26.2, iOS 26.2, *)) {
         if ([ctx->device supportsFamily:(MTLGPUFamily)5002]) {
             // Try compiling NAX shaders with Metal 4.0
             NSArray *nax_paths = @[@"nax_gemm.metal", @"metal_infer/nax_gemm.metal"];
@@ -3069,11 +3069,14 @@ static MetalCtx *metal_setup(void) {
                         ctx->nax_c_buf = [ctx->device newBufferWithLength:(size_t)32 * VOCAB_SIZE * sizeof(float)
                                                                    options:MTLResourceStorageModeShared];
                         printf("[metal] NAX (Metal 4) enabled — tensor matmul for LM head\n");
+                    } else {
+                        printf("[metal] NAX shader compile succeeded but pipeline creation failed, using standard kernels\n");
                     }
+                } else {
+                    printf("[metal] NAX shader compile failed: %s\n", error ? [[error localizedDescription] UTF8String] : "unknown");
                 }
-            }
-            if (!ctx->has_nax) {
-                printf("[metal] NAX shader compile failed, using standard kernels\n");
+            } else {
+                printf("[metal] NAX shader source not found, using standard kernels\n");
             }
         }
     }
