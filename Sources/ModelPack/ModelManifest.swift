@@ -23,9 +23,15 @@ public struct ModelManifest: Sendable {
     }
 
     public var layerTypes: [String] {
+        // 1. PA manifest layer types (highest priority)
         if let types = paManifest?.layerTypes, types.count == hfConfig.numHiddenLayers {
             return types
         }
+        // 2. HF config layer types (from text_config.layer_types, already mapped to gdn/full_attn)
+        if let types = hfConfig.layerTypes, types.count == hfConfig.numHiddenLayers {
+            return types
+        }
+        // 3. Default: every 4th layer is full_attn
         return (0..<hfConfig.numHiddenLayers).map { i in
             i % 4 == 3 ? "full_attn" : "gdn"
         }
