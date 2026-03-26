@@ -83,6 +83,7 @@ struct ChatView: View {
                         proxy.scrollTo("bottom-anchor", anchor: .bottom)
                     }
                 }
+                .scrollDismissesKeyboard(.interactively)
             }
 
             // Stats bar
@@ -111,6 +112,17 @@ struct ChatView: View {
         #endif
         .toolbar {
             #if os(iOS)
+            ToolbarItem(placement: .principal) {
+                VStack(spacing: 1) {
+                    Text(viewModel.conversation?.title ?? "Chat")
+                        .font(.headline)
+                    if let name = engine.modelInfo?.name {
+                        Text(name)
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+            }
             ToolbarItem(placement: .topBarTrailing) {
                 Button {
                     showSystemPrompt = true

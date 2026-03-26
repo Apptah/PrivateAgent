@@ -2,6 +2,7 @@ import SwiftUI
 
 struct InputBar: View {
     @Bindable var viewModel: ChatViewModel
+    @FocusState private var isFocused: Bool
 
     var body: some View {
         HStack(alignment: .bottom, spacing: 10) {
@@ -10,9 +11,11 @@ struct InputBar: View {
                 .padding(.horizontal, 14)
                 .padding(.vertical, 10)
                 .background(.quaternary, in: RoundedRectangle(cornerRadius: 20))
+                .focused($isFocused)
                 .disabled(viewModel.isGenerating)
                 .onSubmit {
                     if !viewModel.isGenerating && !viewModel.inputText.isEmpty {
+                        isFocused = false
                         viewModel.sendMessage()
                     }
                 }
@@ -29,6 +32,7 @@ struct InputBar: View {
                 .buttonStyle(.plain)
             } else {
                 Button {
+                    isFocused = false
                     viewModel.sendMessage()
                 } label: {
                     Image(systemName: "arrow.up.circle.fill")
