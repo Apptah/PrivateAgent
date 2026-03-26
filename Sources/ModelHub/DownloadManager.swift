@@ -81,6 +81,7 @@ public final class DownloadManager: NSObject {
             status: .downloading
         )
         activeDownloads[entry.id] = progress
+        completedBytes[entry.id] = 0
 
         await stateStore.set(DownloadState(
             catalogId: entry.id,
@@ -168,6 +169,12 @@ public final class DownloadManager: NSObject {
     /// Maps URLSession task identifier → (catalogId, file metadata, destination directory).
     private var taskMap: [Int: (catalogId: String, file: ModelFile, destDir: URL)] = [:]
 
+    /// Tracks cumulative bytes written per active task (by task identifier).
+    private var taskBytesWritten: [Int: Int64] = [:]
+
+    /// Tracks total bytes from completed files per catalog entry.
+    private var completedBytes: [String: UInt64] = [:]
+
     private func huggingFaceURL(repoId: String, filename: String) -> URL {
         // https://huggingface.co/<owner>/<repo>/resolve/main/<filename>
         URL(string: "https://huggingface.co/\(repoId)/resolve/main/\(filename)")!
@@ -214,6 +221,7 @@ extension DownloadManager: URLSessionDownloadDelegate {
             markFailed(catalogId: info.catalogId, reason: error.localizedDescription)
         }
 
+        taskBytesWritten.removeValue(forKey: downloadTask.taskIdentifier)
         taskMap.removeValue(forKey: downloadTask.taskIdentifier)
     }
 
@@ -224,6 +232,7 @@ extension DownloadManager: URLSessionDownloadDelegate {
     ) {
         guard let error else { return }
         guard let info = taskMap[task.taskIdentifier] else { return }
+        taskBytesWritten.removeValue(forKey: task.taskIdentifier)
         taskMap.removeValue(forKey: task.taskIdentifier)
         DispatchQueue.main.async {
             self.markFailed(catalogId: info.catalogId, reason: error.localizedDescription)
@@ -238,21 +247,25 @@ extension DownloadManager: URLSessionDownloadDelegate {
         totalBytesExpectedToWrite: Int64
     ) {
         guard let info = taskMap[downloadTask.taskIdentifier] else { return }
-        let written = UInt64(max(0, bytesWritten))
+
+        // Store cumulative bytes for this task
+        taskBytesWritten[downloadTask.taskIdentifier] = totalBytesWritten
+
+        // Compute total: completed files + all active tasks' cumulative bytes
+        let completed = completedBytes[info.catalogId] ?? 0
+        let activeTotal = taskMap
+            .filter { $0.value.catalogId == info.catalogId }
+            .reduce(UInt64(0)) { sum, entry in
+                sum + UInt64(max(0, taskBytesWritten[entry.key] ?? 0))
+            }
+        let totalDownloaded = completed + activeTotal
+        let currentFile = info.file.filename
 
         DispatchQueue.main.async {
             if var progress = self.activeDownloads[info.catalogId] {
-                progress.bytesDownloaded += written
-                progress.currentFile = info.file.filename
+                progress.bytesDownloaded = totalDownloaded
+                progress.currentFile = currentFile
                 self.activeDownloads[info.catalogId] = progress
-            }
-
-            Task {
-                if var state = await self.stateStore.get(info.catalogId) {
-                    state.downloadedBytes += written
-                    state.lastUpdated = Date()
-                    await self.stateStore.set(state)
-                }
             }
         }
     }
@@ -260,13 +273,17 @@ extension DownloadManager: URLSessionDownloadDelegate {
     // MARK: Private helpers
 
     private func recordFileCompleted(catalogId: String, file: ModelFile) {
+        // Add this file's size to completed bytes tracker
+        completedBytes[catalogId, default: 0] += file.sizeBytes
+
         if var progress = activeDownloads[catalogId] {
             progress.filesCompleted += 1
-            progress.bytesDownloaded += file.sizeBytes
+            progress.bytesDownloaded = completedBytes[catalogId] ?? 0
 
             if progress.filesCompleted >= progress.filesTotal {
                 progress.status = .complete
                 activeDownloads.removeValue(forKey: catalogId)
+                completedBytes.removeValue(forKey: catalogId)
             } else {
                 activeDownloads[catalogId] = progress
             }
