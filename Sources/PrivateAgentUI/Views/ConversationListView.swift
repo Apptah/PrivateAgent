@@ -6,6 +6,8 @@ struct ConversationListView: View {
     @Query(sort: \Conversation.updatedAt, order: .reverse) private var conversations: [Conversation]
 
     @State private var searchText = ""
+    @State private var showSettings = false
+    @State private var showModels = false
     @Binding var path: NavigationPath
 
     var filteredConversations: [Conversation] {
@@ -42,6 +44,20 @@ struct ConversationListView: View {
                     Image(systemName: "square.and.pencil")
                 }
             }
+            ToolbarItem(placement: .topBarTrailing) {
+                Button {
+                    showModels = true
+                } label: {
+                    Image(systemName: "square.grid.2x2")
+                }
+            }
+            ToolbarItem(placement: .topBarTrailing) {
+                Button {
+                    showSettings = true
+                } label: {
+                    Image(systemName: "gear")
+                }
+            }
             ToolbarItem(placement: .topBarLeading) {
                 EditButton()
             }
@@ -53,7 +69,41 @@ struct ConversationListView: View {
                     Image(systemName: "square.and.pencil")
                 }
             }
+            ToolbarItem(placement: .automatic) {
+                Button {
+                    showModels = true
+                } label: {
+                    Image(systemName: "square.grid.2x2")
+                }
+            }
+            ToolbarItem(placement: .automatic) {
+                Button {
+                    showSettings = true
+                } label: {
+                    Image(systemName: "gear")
+                }
+            }
             #endif
+        }
+        .sheet(isPresented: $showSettings) {
+            NavigationStack {
+                SettingsView()
+                    .toolbar {
+                        ToolbarItem(placement: .confirmationAction) {
+                            Button("Done") { showSettings = false }
+                        }
+                    }
+            }
+        }
+        .sheet(isPresented: $showModels) {
+            NavigationStack {
+                ModelManagerView()
+                    .toolbar {
+                        ToolbarItem(placement: .confirmationAction) {
+                            Button("Done") { showModels = false }
+                        }
+                    }
+            }
         }
     }
 
