@@ -14,7 +14,7 @@ class Conversation {
 
     init(
         title: String = "New Chat",
-        systemPrompt: String = "You are a helpful assistant.",
+        systemPrompt: String = "You are a helpful assistant. /no_think",
         modelId: String = "default"
     ) {
         self.id = UUID()
