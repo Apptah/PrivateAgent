@@ -4,6 +4,7 @@
 #include <stdio.h>
 #include <time.h>
 #include <unistd.h>
+#include <stdatomic.h>
 
 #ifdef PA_USE_REAL_ENGINE
 #include "FlashMoEEngine.h"
@@ -15,7 +16,7 @@ struct PA_Session {
     PA_MemoryBudget memory_budget;
     int model_loaded;
     char last_error[512];
-    int cancelled;
+    atomic_int cancelled;
     int32_t turn_count;
     PA_GenerationStats last_gen_stats;
 #ifdef PA_USE_REAL_ENGINE
@@ -171,7 +172,7 @@ int pa_session_generate(PA_Session *session, const char *prompt,
                         PA_TokenCallback callback, void *user_data) {
     if (!session || !prompt) return PA_STATUS_ERROR_GENERIC;
 
-    session->cancelled = 0;
+    atomic_store_explicit(&session->cancelled, 0, memory_order_release);
 
 #ifdef PA_USE_REAL_ENGINE
     if (!session->engine_ctx) {
@@ -187,9 +188,9 @@ int pa_session_generate(PA_Session *session, const char *prompt,
     session->state = PA_SESSION_PREFILL;
     int result = flashmoe_generate(ctx, prompt, max_tokens, pa_bridge_callback, &bridge);
 
-    if (session->cancelled) {
+    if (atomic_load_explicit(&session->cancelled, memory_order_acquire)) {
         session->state = PA_SESSION_CANCELLED;
-        return PA_STATUS_OK;
+        return PA_STATUS_CANCELLED;
     }
 
     if (result < 0) {
@@ -242,9 +243,9 @@ int pa_session_generate(PA_Session *session, const char *prompt,
     int32_t tokens_generated = 0;
 
     for (int i = 0; i < mock_count; i++) {
-        if (session->cancelled) {
+        if (atomic_load_explicit(&session->cancelled, memory_order_acquire)) {
             session->state = PA_SESSION_CANCELLED;
-            return PA_STATUS_OK;
+            return PA_STATUS_CANCELLED;
         }
 
         usleep(10000); // 10ms per token
@@ -262,9 +263,9 @@ int pa_session_generate(PA_Session *session, const char *prompt,
         if (callback) {
             int cancel = callback(mock_tokens[i], (int32_t)i, tokens_generated, tps, user_data);
             if (cancel != 0) {
-                session->cancelled = 1;
+                atomic_store_explicit(&session->cancelled, 1, memory_order_release);
                 session->state = PA_SESSION_CANCELLED;
-                return PA_STATUS_OK;
+                return PA_STATUS_CANCELLED;
             }
         }
     }
@@ -300,7 +301,7 @@ int pa_session_generate_continuation(PA_Session *session, const char *user_messa
         return PA_STATUS_ERROR_GENERIC;
     }
 
-    session->cancelled = 0;
+    atomic_store_explicit(&session->cancelled, 0, memory_order_release);
 
     FlashMoEContext *ctx = (FlashMoEContext *)session->engine_ctx;
     struct pa_callback_bridge bridge = { callback, user_data };
@@ -311,9 +312,9 @@ int pa_session_generate_continuation(PA_Session *session, const char *user_messa
     int result = flashmoe_generate_continuation(ctx, user_message, max_tokens,
                                                 pa_bridge_callback, &bridge);
 
-    if (session->cancelled) {
+    if (atomic_load_explicit(&session->cancelled, memory_order_acquire)) {
         session->state = PA_SESSION_CANCELLED;
-        return PA_STATUS_OK;
+        return PA_STATUS_CANCELLED;
     }
 
     if (result < 0) {
@@ -347,7 +348,8 @@ int pa_session_generate_continuation(PA_Session *session, const char *user_messa
 
 void pa_session_cancel(PA_Session *session) {
     if (!session) return;
-    session->cancelled = 1;
+    printf("[C] pa_session_cancel called, state=%d\n", session->state);
+    atomic_store_explicit(&session->cancelled, 1, memory_order_release);
 #ifdef PA_USE_REAL_ENGINE
     if (session->engine_ctx) {
         flashmoe_cancel((FlashMoEContext *)session->engine_ctx);
@@ -359,7 +361,7 @@ void pa_session_reset(PA_Session *session) {
     if (!session) return;
     session->turn_count = 0;
     memset(&session->last_gen_stats, 0, sizeof(PA_GenerationStats));
-    session->cancelled = 0;
+    atomic_store_explicit(&session->cancelled, 0, memory_order_release);
     session->state = PA_SESSION_IDLE;
 #ifdef PA_USE_REAL_ENGINE
     if (session->engine_ctx) {

@@ -221,6 +221,7 @@ final class ChatViewModel {
     }
 
     func cancel() {
+        print("[CHAT] stop tapped, isGenerating=\(isGenerating)")
         engine.cancel()
         generationTask?.cancel()
         generationTask = nil

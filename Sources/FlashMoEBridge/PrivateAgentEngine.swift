@@ -266,7 +266,9 @@ public final class PrivateAgentEngine {
             nonisolated(unsafe) let sendableRawCtx = Unmanaged.passRetained(ctx).toOpaque()
 
             // Register cancellation *before* dispatching work.
-            continuation.onTermination = { _ in
+            // pa_session_cancel is thread-safe (atomic flag + flashmoe_cancel).
+            continuation.onTermination = { @Sendable _ in
+                print("[ENGINE] stream terminated, calling pa_session_cancel")
                 pa_session_cancel(sendableSession)
             }
 
@@ -275,11 +277,12 @@ public final class PrivateAgentEngine {
                     let ctx = Unmanaged<CallbackContext>.fromOpaque(userData!).takeUnretainedValue()
                     let text = tokenText.map { String(cString: $0) } ?? ""
                     ctx.continuation.yield(.token(text: text, id: Int(tokenID)))
-                    return 0  // 0 = continue
+                    return 0  // 0 = continue; cancellation is handled by pa_session_cancel
                 }
 
                 var mutableConfig = cConfig
                 let result = pa_session_generate(sendableSession, prompt, &mutableConfig, tokenCallback, sendableRawCtx)
+                print("[ENGINE] generate returned \(result) (0=OK, -11=CANCELLED)")
 
                 // Collect stats regardless of result.
                 var rawStats = PA_GenerationStats()
@@ -293,14 +296,17 @@ public final class PrivateAgentEngine {
                 // Release the retained context now that the C side is done.
                 Unmanaged<CallbackContext>.fromOpaque(sendableRawCtx).release()
 
-                // Capture error string on engine queue before switching to main
-                let errorMsg: String? = (result != Int32(PA_STATUS_OK.rawValue))
+                let wasCancelled = (result == Int32(PA_STATUS_CANCELLED.rawValue))
+                let errorMsg: String? = (!wasCancelled && result != Int32(PA_STATUS_OK.rawValue))
                     ? String(cString: pa_session_last_error(sendableSession))
                     : nil
 
                 DispatchQueue.main.async {
                     guard let self else { return }
-                    if let errorMsg {
+                    if wasCancelled {
+                        self.state = .ready
+                        continuation.finish()  // clean termination, no error, no .finished event
+                    } else if let errorMsg {
                         self.state = .error(errorMsg)
                         self.lastError = errorMsg
                         continuation.finish(throwing: EngineError.generationFailed(errorMsg))
@@ -315,11 +321,16 @@ public final class PrivateAgentEngine {
     }
 
     /// Cancel any in-progress generation.
-    public func cancel() {
-        guard let s = session else { return }
-        engineQueue.async {
-            pa_session_cancel(s)
+    /// pa_session_cancel is thread-safe (sets an atomic flag + calls flashmoe_cancel),
+    /// so we call it directly — dispatching to engineQueue would deadlock because
+    /// pa_session_generate is blocking that queue.
+    public nonisolated func cancel() {
+        guard let s = session else {
+            print("[ENGINE] cancel() called but session is nil")
+            return
         }
+        print("[ENGINE] cancel() called, forwarding to pa_session_cancel")
+        pa_session_cancel(s)
     }
 
     /// Reset multi-turn conversation state (clears KV-cache history).
