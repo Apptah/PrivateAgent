@@ -13,7 +13,8 @@ public struct ChatMessage: Sendable {
 public enum PromptCompiler {
     public static func compile(
         messages: [ChatMessage],
-        addGenerationPrompt: Bool = true
+        addGenerationPrompt: Bool = true,
+        enableThinking: Bool = false
     ) -> String {
         var result = ""
         for message in messages {
@@ -23,6 +24,10 @@ public enum PromptCompiler {
         }
         if addGenerationPrompt {
             result += "<|im_start|>assistant\n"
+            if !enableThinking {
+                // Skip thinking by pre-filling empty think block
+                result += "<think>\n</think>\n"
+            }
         }
         return result
     }
@@ -37,5 +42,5 @@ public enum PromptCompiler {
         return result
     }
 
-    public static let defaultSystemPrompt = "You are a helpful assistant."
+    public static let defaultSystemPrompt = "You are a helpful assistant. /no_think"
 }
