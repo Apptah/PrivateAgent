@@ -46,9 +46,10 @@ final class ChatViewModel {
 
         // Auto-load model if engine isn't ready
         if engine.state == .idle {
+            print("[CHAT] Engine idle, auto-loading model...")
             Task {
                 await autoLoadModel()
-                // Retry send after load
+                print("[CHAT] After autoLoad, engine state: \(engine.state)")
                 if engine.state == .ready {
                     sendMessageInternal(conversation: conversation)
                 }
@@ -56,7 +57,8 @@ final class ChatViewModel {
             return
         }
         if engine.state != .ready {
-            currentStats = "Engine state: \(engine.state)"
+            print("[CHAT] Engine not ready, state: \(engine.state)")
+            currentStats = "Engine not ready"
             return
         }
 
@@ -64,18 +66,28 @@ final class ChatViewModel {
     }
 
     private func autoLoadModel() async {
+        print("[CHAT] autoLoadModel: scanning for downloaded models...")
         let storage = ModelStorage()
         let models = (try? await storage.listModels()) ?? []
+        print("[CHAT] Found \(models.count) model(s): \(models.map { $0.lastPathComponent })")
         guard let modelDir = models.first else {
+            print("[CHAT] ❌ No models found!")
             currentStats = "No model downloaded. Go to Models to download one."
             return
         }
+        print("[CHAT] Loading model from: \(modelDir.path)")
         currentStats = "Loading model..."
         do {
             let manifest = try ModelManifest(modelDir: modelDir)
+            print("[CHAT] Manifest parsed: \(manifest.hfConfig.numHiddenLayers) layers, \(manifest.hfConfig.vocabSize) vocab")
             try await engine.loadModel(from: manifest)
+            print("[CHAT] ✅ Model loaded! State: \(engine.state)")
+            if let info = engine.modelInfo {
+                print("[CHAT] Model info: maxContext=\(info.maxContext), dirty=\(info.totalDirtyMB)MB")
+            }
             currentStats = "Model loaded!"
         } catch {
+            print("[CHAT] ❌ Load failed: \(error)")
             currentStats = "Load failed: \(error.localizedDescription)"
         }
     }
