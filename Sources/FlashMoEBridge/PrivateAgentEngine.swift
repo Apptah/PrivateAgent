@@ -80,7 +80,7 @@ public struct GenerationConfig: Sendable {
     public var thinkBudget: Int
 
     public static let `default` = GenerationConfig(
-        maxTokens: 512, temperature: 0.7, topP: 0.8, thinkBudget: 0
+        maxTokens: 2048, temperature: 0.7, topP: 0.9, thinkBudget: 0
     )
 
     public init(maxTokens: Int = 2048, temperature: Float = 0.7, topP: Float = 0.9, thinkBudget: Int = 0) {
@@ -275,6 +275,10 @@ public final class PrivateAgentEngine {
             self.engineQueue.async { [weak self] in
                 let tokenCallback: PA_TokenCallback = { tokenText, tokenID, _, tps, userData in
                     let ctx = Unmanaged<CallbackContext>.fromOpaque(userData!).takeUnretainedValue()
+                    // tokenID < 0 signals prefill progress from C engine, not a real token
+                    guard tokenID >= 0 else {
+                        return 0
+                    }
                     let text = tokenText.map { String(cString: $0) } ?? ""
                     ctx.continuation.yield(.token(text: text, id: Int(tokenID)))
                     return 0  // 0 = continue; cancellation is handled by pa_session_cancel
