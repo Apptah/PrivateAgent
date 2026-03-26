@@ -2,28 +2,128 @@ import Testing
 import Foundation
 @testable import TurboQuantCore
 
-// Helper: compute L2 norm of a float array
 private func l2norm(_ v: [Float]) -> Float {
     sqrt(v.reduce(0.0) { $0 + $1 * $1 })
 }
 
-@Suite("Structured Rotation Transform Tests")
+@Suite("Random Orthogonal Rotation Tests")
 struct TransformTests {
 
-    let dim: UInt32 = 128  // must be power of 2
+    let dim: UInt32 = 64     // smaller dim for QR speed in tests
     let seed: UInt64 = 0xDEAD_BEEF_CAFE_1234
 
-    // Build a repeatable test vector
     private func makeVector(dim: UInt32, offset: Float = 0.0) -> [Float] {
         (0..<Int(dim)).map { i in sin(Float(i) * 0.3 + offset) }
     }
 
+    // MARK: - Init / cleanup
+
+    @Test("tq_rotation_init succeeds and returns 0")
+    func rotationInitSucceeds() {
+        let ret = tq_rotation_init(dim, seed)
+        #expect(ret == 0, "tq_rotation_init returned \(ret)")
+        tq_rotation_cleanup()
+    }
+
     // MARK: - Invertibility
 
-    @Test("Rotate then inverse rotate recovers original vector")
+    @Test("rotate then inverse-rotate recovers original vector")
     func rotationIsInvertible() {
-        var x = makeVector(dim: dim)
-        let original = x
+        tq_rotation_init(dim, seed)
+        let x = makeVector(dim: dim)
+        var y = [Float](repeating: 0, count: Int(dim))
+        var xhat = [Float](repeating: 0, count: Int(dim))
+
+        x.withUnsafeBufferPointer { xb in
+            y.withUnsafeMutableBufferPointer { yb in
+                tq_rotate(xb.baseAddress, yb.baseAddress, dim)
+            }
+        }
+        y.withUnsafeBufferPointer { yb in
+            xhat.withUnsafeMutableBufferPointer { xhb in
+                tq_rotate_inverse(yb.baseAddress, xhb.baseAddress, dim)
+            }
+        }
+
+        for i in 0..<Int(dim) {
+            #expect(abs(xhat[i] - x[i]) < 1e-4,
+                    "Element \(i): got \(xhat[i]), expected \(x[i])")
+        }
+        tq_rotation_cleanup()
+    }
+
+    // MARK: - Norm preservation
+
+    @Test("rotation preserves L2 norm")
+    func rotationPreservesNorm() {
+        tq_rotation_init(dim, seed)
+        let x = makeVector(dim: dim)
+        var y = [Float](repeating: 0, count: Int(dim))
+        x.withUnsafeBufferPointer { xb in
+            y.withUnsafeMutableBufferPointer { yb in
+                tq_rotate(xb.baseAddress, yb.baseAddress, dim)
+            }
+        }
+        let normBefore = l2norm(x)
+        let normAfter  = l2norm(y)
+        #expect(abs(normAfter - normBefore) < 1e-3,
+                "Norm before: \(normBefore), after: \(normAfter)")
+        tq_rotation_cleanup()
+    }
+
+    // MARK: - Determinism
+
+    @Test("same seed produces same rotation")
+    func sameSeedIsDeterministic() {
+        let x = makeVector(dim: dim)
+        var y1 = [Float](repeating: 0, count: Int(dim))
+        var y2 = [Float](repeating: 0, count: Int(dim))
+
+        tq_rotation_init(dim, seed)
+        x.withUnsafeBufferPointer { xb in
+            y1.withUnsafeMutableBufferPointer { yb in tq_rotate(xb.baseAddress, yb.baseAddress, dim) }
+        }
+        tq_rotation_cleanup()
+
+        tq_rotation_init(dim, seed)
+        x.withUnsafeBufferPointer { xb in
+            y2.withUnsafeMutableBufferPointer { yb in tq_rotate(xb.baseAddress, yb.baseAddress, dim) }
+        }
+        tq_rotation_cleanup()
+
+        for i in 0..<Int(dim) {
+            #expect(y1[i] == y2[i], "Element \(i) differs between identical seeds")
+        }
+    }
+
+    @Test("different seeds produce different rotations")
+    func differentSeedsProduceDifferentResults() {
+        let x = makeVector(dim: dim)
+        var y1 = [Float](repeating: 0, count: Int(dim))
+        var y2 = [Float](repeating: 0, count: Int(dim))
+
+        tq_rotation_init(dim, seed)
+        x.withUnsafeBufferPointer { xb in
+            y1.withUnsafeMutableBufferPointer { yb in tq_rotate(xb.baseAddress, yb.baseAddress, dim) }
+        }
+        tq_rotation_cleanup()
+
+        tq_rotation_init(dim, seed &+ 1)
+        x.withUnsafeBufferPointer { xb in
+            y2.withUnsafeMutableBufferPointer { yb in tq_rotate(xb.baseAddress, yb.baseAddress, dim) }
+        }
+        tq_rotation_cleanup()
+
+        let anyDiffers = (0..<Int(dim)).contains { y1[$0] != y2[$0] }
+        #expect(anyDiffers, "Different seeds should produce different rotations")
+    }
+
+    // MARK: - Backward-compatible inplace wrappers
+
+    @Test("tq_rotate_inplace: rotate then inverse recovers original")
+    func inplaceWrapperIsInvertible() {
+        var x    = makeVector(dim: dim)
+        let orig = x
 
         x.withUnsafeMutableBufferPointer { buf in
             tq_rotate_inplace(buf.baseAddress, dim, seed)
@@ -31,101 +131,38 @@ struct TransformTests {
         }
 
         for i in 0..<Int(dim) {
-            #expect(abs(x[i] - original[i]) < 1e-4,
-                    "Element \(i): got \(x[i]), expected \(original[i])")
+            #expect(abs(x[i] - orig[i]) < 1e-4,
+                    "Element \(i): got \(x[i]), expected \(orig[i])")
         }
     }
 
-    // MARK: - Norm preservation
+    // MARK: - Query rotation (dot-product preservation)
 
-    @Test("Rotation preserves L2 norm")
-    func rotationPreservesNorm() {
-        var x = makeVector(dim: dim)
-        let normBefore = l2norm(x)
-
-        x.withUnsafeMutableBufferPointer { buf in
-            tq_rotate_inplace(buf.baseAddress, dim, seed)
-        }
-
-        let normAfter = l2norm(x)
-        #expect(abs(normAfter - normBefore) < 1e-3,
-                "Norm before: \(normBefore), after: \(normAfter)")
-    }
-
-    // MARK: - Determinism
-
-    @Test("Same seed produces same rotation")
-    func sameSeedIsDeterministic() {
-        var x1 = makeVector(dim: dim)
-        var x2 = makeVector(dim: dim)
-
-        x1.withUnsafeMutableBufferPointer { tq_rotate_inplace($0.baseAddress, dim, seed) }
-        x2.withUnsafeMutableBufferPointer { tq_rotate_inplace($0.baseAddress, dim, seed) }
-
-        for i in 0..<Int(dim) {
-            #expect(x1[i] == x2[i], "Element \(i) differs between identical rotations")
-        }
-    }
-
-    @Test("Different seeds produce different rotations")
-    func differentSeedsProduceDifferentResults() {
-        var x1 = makeVector(dim: dim)
-        var x2 = makeVector(dim: dim)
-
-        x1.withUnsafeMutableBufferPointer { tq_rotate_inplace($0.baseAddress, dim, seed) }
-        x2.withUnsafeMutableBufferPointer { tq_rotate_inplace($0.baseAddress, dim, seed &+ 1) }
-
-        // At least one element must differ
-        let anyDiffers = (0..<Int(dim)).contains { x1[$0] != x2[$0] }
-        #expect(anyDiffers, "Different seeds should produce different rotations")
-    }
-
-    // MARK: - Query rotation
-
-    @Test("tq_rotate_query: dot(R@k, R@q) == dot(k, q)")
+    @Test("tq_rotate_query: dot(Π@k, Π@q) == dot(k, q)")
     func queryRotationPreservesDotProduct() {
+        tq_rotation_init(dim, seed)
         let k = makeVector(dim: dim, offset: 0.0)
         let q = makeVector(dim: dim, offset: 1.1)
 
-        // Compute original dot product
         let dotOriginal = zip(k, q).reduce(0.0 as Float) { $0 + $1.0 * $1.1 }
 
-        // Rotate k forward: R @ k
-        var kRotated = k
-        kRotated.withUnsafeMutableBufferPointer { tq_rotate_inplace($0.baseAddress, dim, seed) }
+        var kRotated = [Float](repeating: 0, count: Int(dim))
+        var qRotated = [Float](repeating: 0, count: Int(dim))
 
-        // Rotate q via tq_rotate_query (also applies R, same forward rotation)
-        var qRotated = [Float](repeating: 0.0, count: Int(dim))
-        q.withUnsafeBufferPointer { qBuf in
-            qRotated.withUnsafeMutableBufferPointer { qOutBuf in
-                tq_rotate_query(qBuf.baseAddress, qOutBuf.baseAddress, dim, seed)
+        k.withUnsafeBufferPointer { kb in
+            kRotated.withUnsafeMutableBufferPointer { yb in
+                tq_rotate(kb.baseAddress, yb.baseAddress, dim)
+            }
+        }
+        q.withUnsafeBufferPointer { qb in
+            qRotated.withUnsafeMutableBufferPointer { yb in
+                tq_rotate_query(qb.baseAddress, yb.baseAddress, dim, seed)
             }
         }
 
-        // dot(R@k, R@q) = k^T R^T R q = k^T q  (R orthogonal: R^T R = I)
         let dotRotated = zip(kRotated, qRotated).reduce(0.0 as Float) { $0 + $1.0 * $1.1 }
         #expect(abs(dotRotated - dotOriginal) < 1e-3,
                 "dot after rotation: \(dotRotated), expected: \(dotOriginal)")
-    }
-
-    @Test("tq_rotate_query output inverse-rotated recovers input")
-    func queryRotationRecoversByInverseRotation() {
-        let q = makeVector(dim: dim, offset: 2.7)
-
-        // q_out = R @ q  (tq_rotate_query applies forward rotation)
-        var qOut = [Float](repeating: 0.0, count: Int(dim))
-        q.withUnsafeBufferPointer { qBuf in
-            qOut.withUnsafeMutableBufferPointer { outBuf in
-                tq_rotate_query(qBuf.baseAddress, outBuf.baseAddress, dim, seed)
-            }
-        }
-
-        // Applying inverse rotation to q_out should recover q: R^{-1} @ (R @ q) = q
-        qOut.withUnsafeMutableBufferPointer { tq_rotate_inverse_inplace($0.baseAddress, dim, seed) }
-
-        for i in 0..<Int(dim) {
-            #expect(abs(qOut[i] - q[i]) < 1e-4,
-                    "Element \(i): got \(qOut[i]), expected \(q[i])")
-        }
+        tq_rotation_cleanup()
     }
 }

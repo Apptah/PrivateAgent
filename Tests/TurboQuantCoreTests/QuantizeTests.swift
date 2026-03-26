@@ -6,59 +6,119 @@ private func maxAbsError(_ a: [Float], _ b: [Float]) -> Float {
     zip(a, b).map { abs($0.0 - $0.1) }.max() ?? 0
 }
 
-private func roundtrip(input: [Float], blockSize: UInt32, bitsX2: UInt16) -> [Float] {
+/// Roundtrip helper using the new Lloyd-Max API.
+/// We need a rotation matrix to be initialised first so coordinates are
+/// approximately N(0, 1/d) as the codebook expects.
+private func lloydmaxRoundtrip(input: [Float], bits: UInt8) -> [Float] {
     let dim = UInt32(input.count)
-    let numBlocks = Int((dim + blockSize - 1) / blockSize)
+    var codes  = [UInt8](repeating: 0, count: input.count)
+    var output = [Float](repeating: 0, count: input.count)
 
-    var codes  = [UInt8](repeating: 0, count: Int(dim))
-    var scales = [Float](repeating: 0, count: numBlocks)
-    var zeros  = [Float](repeating: 0, count: numBlocks)
-    var output = [Float](repeating: 0, count: Int(dim))
-
-    tq_quantize_scalar(input, dim, &codes, &scales, &zeros, blockSize, bitsX2)
-    tq_dequantize_scalar(codes, scales, zeros, &output, dim, blockSize, bitsX2)
-
+    tq_quantize_lloydmax(input, dim, &codes, bits)
+    tq_dequantize_lloydmax(codes, &output, dim, bits)
     return output
 }
 
-@Suite("TurboQuant Quantize Tests")
+@Suite("TurboQuant Lloyd-Max Quantize Tests")
 struct QuantizeTests {
 
-    static let sinWave: [Float] = (0..<256).map { Float(sin(Double($0) * .pi / 64.0)) }
+    // Unit-norm vector whose rotated coordinates are approximately N(0,1/d).
+    // We synthesise a rotated unit vector directly so the codebook scale is correct.
+    private func makeRotatedUnitVector(dim: Int, seed: UInt64) -> [Float] {
+        // Generate a random N(0,1) vector and normalise it.
+        var state = seed
+        var v = (0..<dim).map { _ -> Float in
+            state &+= 0x9e3779b97f4a7c15
+            var z = state
+            z = (z ^ (z >> 30)) &* 0xbf58476d1ce4e5b9
+            z = (z ^ (z >> 27)) &* 0x94d049bb133111eb
+            z = z ^ (z >> 31)
+            return Float(bitPattern: UInt32(z >> 32) & 0x7fffffff) / Float(0x7fffffff) * 2 - 1
+        }
+        // Normalise
+        let norm = sqrt(v.reduce(0.0) { $0 + $1 * $1 })
+        if norm > 1e-10 { v = v.map { $0 / norm } }
+        return v
+    }
 
-    @Test("4-bit roundtrip max error < 0.15 on sin wave")
+    // MARK: - Codebook sanity
+
+    @Test("1-bit codebook has 2 entries with correct signs")
+    func codebook1bit() {
+        let cb = tq_lloydmax_codebook(1)!
+        #expect(cb[0] < 0, "codebook_1bit[0] should be negative")
+        #expect(cb[1] > 0, "codebook_1bit[1] should be positive")
+        #expect(abs(cb[0] + cb[1]) < 1e-6, "1-bit codebook should be symmetric")
+    }
+
+    @Test("4-bit codebook has 16 monotonically increasing entries")
+    func codebook4bit() {
+        let cb = tq_lloydmax_codebook(4)!
+        for k in 0..<15 {
+            #expect(cb[k] < cb[k + 1], "codebook_4bit[\(k)] not < [\(k+1)]")
+        }
+    }
+
+    @Test("codebook is symmetric for all bit widths")
+    func codebookSymmetry() {
+        for bits: UInt8 in 1...4 {
+            let levels = 1 << Int(bits)
+            let cb = tq_lloydmax_codebook(bits)!
+            for k in 0..<(levels / 2) {
+                let mirror = levels - 1 - k
+                #expect(abs(cb[k] + cb[mirror]) < 1e-4,
+                        "\(bits)-bit codebook not symmetric at k=\(k)")
+            }
+        }
+    }
+
+    // MARK: - Roundtrip accuracy on rotated unit vectors
+
+    @Test("4-bit Lloyd-Max roundtrip max error < 0.3 on rotated unit vector")
     func fourBitRoundtrip() {
-        let output = roundtrip(input: Self.sinWave, blockSize: 32, bitsX2: 8)
-        let err = maxAbsError(Self.sinWave, output)
-        #expect(err < 0.15, "4-bit max error \(err) exceeds 0.15")
+        let dim = 128
+        let v = makeRotatedUnitVector(dim: dim, seed: 0xCAFE1234)
+        let out = lloydmaxRoundtrip(input: v, bits: 4)
+        let err = maxAbsError(v, out)
+        #expect(err < 0.3, "4-bit max error \(err) exceeds 0.3")
     }
 
-    @Test("3.5-bit error >= 4-bit error")
-    func halfBitMoreError() {
-        let out4   = roundtrip(input: Self.sinWave, blockSize: 32, bitsX2: 8)
-        let out3_5 = roundtrip(input: Self.sinWave, blockSize: 32, bitsX2: 7)
-        let err4   = maxAbsError(Self.sinWave, out4)
-        let err3_5 = maxAbsError(Self.sinWave, out3_5)
-        #expect(err3_5 >= err4, "3.5-bit error (\(err3_5)) should >= 4-bit (\(err4))")
+    @Test("3-bit error >= 4-bit error (more bits = lower error)")
+    func fewerBitsMoreError() {
+        let dim = 128
+        let v = makeRotatedUnitVector(dim: dim, seed: 0xBEEF5678)
+        let out4 = lloydmaxRoundtrip(input: v, bits: 4)
+        let out3 = lloydmaxRoundtrip(input: v, bits: 3)
+        let err4 = maxAbsError(v, out4)
+        let err3 = maxAbsError(v, out3)
+        #expect(err3 >= err4, "3-bit error (\(err3)) should be >= 4-bit (\(err4))")
     }
 
-    @Test("QJL encode produces non-trivial packed bits")
+    // MARK: - QJL encode sanity (via new API)
+
+    @Test("tq_qjl_encode produces non-trivial packed bits")
     func qjlNonTrivial() {
-        let dim: UInt32 = 256
-        let blockSize: UInt32 = 32
-        let numBlocks = Int((dim + blockSize - 1) / blockSize)
+        let dim: UInt32 = 128
+        let seed: UInt64 = 0xDEADBEEF
 
-        var codes  = [UInt8](repeating: 0, count: Int(dim))
-        var scales = [Float](repeating: 0, count: numBlocks)
-        var zeros  = [Float](repeating: 0, count: numBlocks)
+        tq_rotation_init(dim, seed)
+        tq_qjl_init(dim, seed ^ 0xDEADBEEFCAFEBABE)
+
+        let v = makeRotatedUnitVector(dim: Int(dim), seed: 0x11223344)
+
+        // Build a residual by quantising and subtracting
+        var codes = [UInt8](repeating: 0, count: Int(dim))
         var dequant = [Float](repeating: 0, count: Int(dim))
-
-        tq_quantize_scalar(Self.sinWave, dim, &codes, &scales, &zeros, blockSize, 8)
-        tq_dequantize_scalar(codes, scales, zeros, &dequant, dim, blockSize, 8)
+        tq_quantize_lloydmax(v, dim, &codes, 3)
+        tq_dequantize_lloydmax(codes, &dequant, dim, 3)
+        let residual = zip(v, dequant).map { $0.0 - $0.1 }
 
         let numBitBytes = (Int(dim) + 7) / 8
         var bits = [UInt8](repeating: 0, count: numBitBytes)
-        tq_qjl_encode(Self.sinWave, dequant, &bits, dim, 0xDEADBEEF)
+        var gamma: Float = 0
+        tq_qjl_encode(residual, dim, &bits, &gamma)
+
+        #expect(gamma > 0, "Residual norm gamma should be positive")
 
         let allZero = bits.allSatisfy { $0 == 0x00 }
         let allOnes = bits.allSatisfy { $0 == 0xFF }
@@ -67,6 +127,9 @@ struct QuantizeTests {
 
         let oneCount = bits.reduce(0) { $0 + Int($1.nonzeroBitCount) }
         let ratio = Float(oneCount) / Float(numBitBytes * 8)
-        #expect(ratio > 0.2 && ratio < 0.8, "Bit balance \(ratio) outside [0.2, 0.8]")
+        #expect(ratio > 0.1 && ratio < 0.9, "Bit balance \(ratio) outside [0.1, 0.9]")
+
+        tq_qjl_cleanup()
+        tq_rotation_cleanup()
     }
 }

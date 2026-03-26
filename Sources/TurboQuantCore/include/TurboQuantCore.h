@@ -6,59 +6,125 @@
 #include <stdint.h>
 #include <stddef.h>
 
-// TurboQuant KV cache compression — CPU reference implementations.
-// Added in Plan 5.
+// TurboQuant KV cache compression — CPU reference implementation.
+// Implements Algorithm 1 (TurboQuant_mse) and Algorithm 2 (TurboQuant_prod)
+// from Google's paper arXiv:2504.19874 (ICLR 2026).
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 
-// ── Plan 5 Task 1: Seed-driven structured rotation ──
+// ── Random orthogonal rotation ────────────────────────────────────────────────
 
-/// Apply structured rotation in-place: R @ x  where R = H @ diag(signs(seed)).
-/// dim must be a power of 2.
+/// Generate and cache a random orthogonal matrix for the given dim+seed.
+/// Uses QR decomposition (modified Gram-Schmidt) of a random normal matrix.
+/// Must be called once before using tq_rotate / tq_rotate_inverse.
+/// Returns 0 on success, -1 on allocation failure.
+int tq_rotation_init(uint32_t dim, uint64_t seed);
+
+/// Free cached rotation matrix.
+void tq_rotation_cleanup(void);
+
+/// Apply rotation: y = Π @ x. dim must match tq_rotation_init.
+void tq_rotate(const float *x, float *y, uint32_t dim);
+
+/// Apply inverse rotation: x = Π^T @ y.
+void tq_rotate_inverse(const float *y, float *x, uint32_t dim);
+
+// ── Backward-compatible wrappers (old inplace API) ────────────────────────────
+
+/// Apply forward rotation in-place. Calls tq_rotation_init if not yet done.
 void tq_rotate_inplace(float *x, uint32_t dim, uint64_t seed);
 
-/// Apply inverse rotation in-place: R^T @ x  (= diag(signs(seed)) @ H @ x).
-/// dim must be a power of 2.
+/// Apply inverse rotation in-place. Calls tq_rotation_init if not yet done.
 void tq_rotate_inverse_inplace(float *x, uint32_t dim, uint64_t seed);
 
-/// Rotate a query vector: q_out = R^{-1} @ q_in  (so that dot(R@k, q_out) == dot(k, q_in)).
-/// q_in and q_out may not alias. dim must be a power of 2.
+/// Rotate a query vector: q_out = Π @ q_in. q_in and q_out must not alias.
 void tq_rotate_query(const float *q_in, float *q_out, uint32_t dim, uint64_t seed);
 
-// ── Plan 5 Task 2: Scalar quantization + QJL (declared, implemented later) ──
+// ── Lloyd-Max quantization ────────────────────────────────────────────────────
 
-/// Quantize input vector. Returns number of bytes written to codes.
+/// Quantize a unit-norm rotated vector using Lloyd-Max codebook.
+/// codes: output indices (1 byte per element, values 0..2^bits-1)
+/// bits: quantization bits per coordinate (1-4)
+/// Returns number of codes written (== dim on success, 0 on error).
+uint32_t tq_quantize_lloydmax(const float *rotated_unit, uint32_t dim,
+                               uint8_t *codes, uint8_t bits);
+
+/// Dequantize codes back to rotated unit vector using Lloyd-Max codebook.
+void tq_dequantize_lloydmax(const uint8_t *codes, float *rotated_unit,
+                              uint32_t dim, uint8_t bits);
+
+/// Get Lloyd-Max codebook for given bit width.
+/// Returns pointer to static array of 2^bits centroids (N(0,1) scale).
+const float *tq_lloydmax_codebook(uint8_t bits);
+
+// ── Backward-compatible scalar quant wrappers ─────────────────────────────────
+
+/// Deprecated: delegates to tq_quantize_lloydmax. scale/zero ignored on new path.
 uint32_t tq_quantize_scalar(const float *input, uint32_t dim,
                              uint8_t *codes, float *scale, float *zero,
                              uint32_t block_size, uint16_t bits_x2);
 
-/// Dequantize codes back to float.
-void tq_dequantize_scalar(const uint8_t *codes, const float *scale, const float *zero,
-                           float *output, uint32_t dim,
+/// Deprecated: delegates to tq_dequantize_lloydmax.
+void tq_dequantize_scalar(const uint8_t *codes, const float *scale,
+                           const float *zero, float *output, uint32_t dim,
                            uint32_t block_size, uint16_t bits_x2);
 
-/// Encode QJL residual bits from the difference between input and its dequantized approximation.
-void tq_qjl_encode(const float *input, const float *dequantized,
-                   uint8_t *residual_bits, uint32_t dim, uint64_t qjl_seed);
+// ── QJL random projection ─────────────────────────────────────────────────────
 
-/// Correct attention scores using QJL residual bits from query and key vectors.
+/// Initialize QJL random projection matrix S (d×d, N(0,1) entries, row-major).
+/// Returns 0 on success, -1 on allocation failure.
+int tq_qjl_init(uint32_t dim, uint64_t seed);
+
+/// Free QJL projection matrix.
+void tq_qjl_cleanup(void);
+
+/// Encode residual via QJL: qjl_bits = sign(S @ residual).
+/// residual_norm_out: stores ‖residual‖₂ (γ).
+void tq_qjl_encode(const float *residual, uint32_t dim,
+                    uint8_t *qjl_bits, float *residual_norm_out);
+
+/// Dequantize QJL correction: output = (sqrt(π/2) / d) * gamma * S^T @ sign_bits.
+void tq_qjl_decode(const uint8_t *qjl_bits, float gamma,
+                    float *output, uint32_t dim);
+
+/// Deprecated no-op: residual correction now done via full dequant + dot.
 void tq_qjl_correct_scores(float *scores, uint32_t num_tokens,
-                            const uint8_t *q_residual_bits, const uint8_t *k_residual_bits,
+                            const uint8_t *q_residual_bits,
+                            const uint8_t *k_residual_bits,
                             uint32_t dim, uint64_t qjl_seed);
 
-// ── Plan 5 Task 3: Compressed KV ops (declared, implemented later) ──
+// ── Compressed KV cache ───────────────────────────────────────────────────────
 
-/// Compress a KV vector according to desc. Returns bytes written to compressed_out.
+/// Compressed KV layout per vector (TurboQuant_prod, Algorithm 2):
+///   [norm:     float32, 4 bytes         ]  ‖x‖₂
+///   [codes:    dim bytes                ]  1 byte per coord, Lloyd-Max index
+///   [gamma:    float32, 4 bytes         ]  ‖residual‖₂
+///   [qjl_bits: ceil(dim/8) bytes        ]  1 bit per projection sign
+/// Total: 8 + dim + ceil(dim/8) bytes
+
+/// Get compressed size per vector in bytes.
+uint32_t tq_compressed_size(uint32_t dim);
+
+/// Compress a KV vector using the full TurboQuant_prod pipeline.
+/// Uses (total_bits - 1) bits for MSE + 1 bit QJL residual.
+/// Returns bytes written to compressed_out (== tq_compressed_size(dim)), or 0 on error.
 uint32_t tq_compress_kv(const float *kv_input, uint32_t dim,
-                         uint8_t *compressed_out, const PA_QuantizedKVDesc *desc);
+                         uint8_t *compressed_out,
+                         const PA_QuantizedKVDesc *desc);
 
-/// Compute dot product between a transformed query and a compressed key.
-float tq_compressed_dot(const float *q_transformed, uint32_t dim,
-                         const uint8_t *k_compressed, const PA_QuantizedKVDesc *desc);
+/// Compute approximate dot product between query and compressed key.
+/// query is in the ORIGINAL (unrotated) space.
+float tq_compressed_dot(const float *query, uint32_t dim,
+                         const uint8_t *k_compressed,
+                         const PA_QuantizedKVDesc *desc);
 
-/// Decompress a compressed value tile into float output.
+/// Decompress a value vector to float (MSE part + QJL correction).
+void tq_decompress_v(const uint8_t *v_compressed, float *v_output,
+                      uint32_t dim, const PA_QuantizedKVDesc *desc);
+
+/// Backward-compatible alias for tq_decompress_v.
 void tq_decompress_v_tile(const uint8_t *v_compressed, float *v_output,
                            uint32_t dim, const PA_QuantizedKVDesc *desc);
 
