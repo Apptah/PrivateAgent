@@ -89,4 +89,4 @@ The architecture is storage-bound, not memory-bound. As phone storage gets faste
 
 ## License
 
-MIT -- see [LICENSE](LICENSE)
+Apache 2.0 -- see [LICENSE](LICENSE)
