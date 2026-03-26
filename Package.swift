@@ -64,7 +64,7 @@ let package = Package(
             dependencies: ["FlashMoECore"],
             path: "Vendor/flash-moe",
             sources: ["FlashMoEEngine.m"],
-            publicHeadersPath: ".",
+            publicHeadersPath: "public",
             cSettings: [
                 .headerSearchPath("."),
                 .define("CHAT_MODE", to: "1"),
@@ -83,9 +83,13 @@ let package = Package(
             dependencies: ["FlashMoECore", "FlashMoEMetal", "TurboQuantCore", "TurboQuantMetal", "FlashMoEVendor"],
             path: "Sources/FlashMoERuntime",
             publicHeadersPath: "include",
+            cSettings: [
+                .define("PA_USE_REAL_ENGINE"),
+            ],
             linkerSettings: [
                 .linkedFramework("Metal"),
                 .linkedFramework("Accelerate"),
+                .linkedLibrary("compression"),
             ]
         ),
 

@@ -98,7 +98,7 @@ int pa_session_load_model(PA_Session *session, const PA_ModelDesc *desc, uint64_
     FlashMoEConfig fmConfig = {0};
     fmConfig.model_path = desc->model_dir;
     fmConfig.max_context = (int)session->memory_budget.max_context_length;
-    fmConfig.think_budget = desc->think_budget;
+    fmConfig.think_budget = 2048;  // default, overridden per-generation
     fmConfig.verbose = 0;
 
     int loadResult = flashmoe_load(ctx, &fmConfig);
