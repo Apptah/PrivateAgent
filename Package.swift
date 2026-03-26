@@ -111,5 +111,9 @@ let package = Package(
             dependencies: ["FlashMoEBridge", "ModelPack"],
             resources: [.copy("Fixtures")]
         ),
+        .testTarget(
+            name: "ModelHubTests",
+            dependencies: ["ModelHub"]
+        ),
     ]
 )
