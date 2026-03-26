@@ -293,17 +293,21 @@ public final class PrivateAgentEngine {
                 // Release the retained context now that the C side is done.
                 Unmanaged<CallbackContext>.fromOpaque(rawCtx).release()
 
+                // Capture error string on engine queue before switching to main
+                let errorMsg: String? = (result != Int32(PA_STATUS_OK.rawValue))
+                    ? String(cString: pa_session_last_error(s))
+                    : nil
+
                 DispatchQueue.main.async {
                     guard let self else { return }
-                    if result == Int32(PA_STATUS_OK.rawValue) {
-                        self.state = .ready
-                        continuation.yield(.finished(stats: stats))
-                        continuation.finish()
-                    } else {
-                        let errorMsg = String(cString: pa_session_last_error(s))
+                    if let errorMsg {
                         self.state = .error(errorMsg)
                         self.lastError = errorMsg
                         continuation.finish(throwing: EngineError.generationFailed(errorMsg))
+                    } else {
+                        self.state = .ready
+                        continuation.yield(.finished(stats: stats))
+                        continuation.finish()
                     }
                 }
             }
