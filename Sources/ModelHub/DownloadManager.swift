@@ -6,7 +6,7 @@ import Foundation
 import Observation
 
 @Observable
-public final class DownloadManager: @unchecked Sendable {
+public final class DownloadManager: NSObject, @unchecked Sendable {
 
     // MARK: - DownloadProgress
 
@@ -28,13 +28,20 @@ public final class DownloadManager: @unchecked Sendable {
 
     // MARK: Lifecycle
 
-    public init() {}
+    public override init() {
+        super.init()
+        session = URLSession(
+            configuration: .default,
+            delegate: self,
+            delegateQueue: nil
+        )
+    }
 
     // MARK: Public
 
     public private(set) var activeDownloads: [String: DownloadProgress] = [:]
 
-    /// Download all files for a catalog entry sequentially with progress.
+    /// Download all files for a catalog entry sequentially.
     public func download(entry: CatalogEntry) async throws {
         guard try await checkFreeSpace(for: entry) else {
             throw DownloadError.insufficientDiskSpace
@@ -47,14 +54,16 @@ public final class DownloadManager: @unchecked Sendable {
 
         // Pre-create subdirectories
         for file in entry.files {
-            let fileURL = destDir.appendingPathComponent(file.filename)
-            let parentDir = fileURL.deletingLastPathComponent()
+            let parentDir = destDir.appendingPathComponent(file.filename).deletingLastPathComponent()
             if parentDir != destDir && !fm.fileExists(atPath: parentDir.path) {
                 try fm.createDirectory(at: parentDir, withIntermediateDirectories: true)
             }
         }
 
-        // Initialize progress
+        // Track which files need downloading
+        var completedBytes: UInt64 = 0
+        var filesToDownload: [ModelFile] = []
+
         var progress = DownloadProgress(
             catalogId: entry.id,
             displayName: entry.displayName,
@@ -66,13 +75,10 @@ public final class DownloadManager: @unchecked Sendable {
             status: .downloading
         )
 
-        // Check which files already exist
-        var completedBytes: UInt64 = 0
-        var filesToDownload: [ModelFile] = []
         for file in entry.files {
             let destURL = destDir.appendingPathComponent(file.filename)
-            if fm.fileExists(atPath: destURL.path) {
-                // Skip already downloaded files
+            if fm.fileExists(atPath: destURL.path),
+               file.sizeBytes == 0 || (try? fm.attributesOfItem(atPath: destURL.path)[.size] as? UInt64) == file.sizeBytes {
                 progress.filesCompleted += 1
                 completedBytes += file.sizeBytes
             } else {
@@ -88,12 +94,8 @@ public final class DownloadManager: @unchecked Sendable {
             return
         }
 
-        // Download files sequentially
-        let session = URLSession.shared
-        currentTask = nil
-
+        // Download each file sequentially
         for file in filesToDownload {
-            // Check cancellation
             guard await activeDownloads[entry.id]?.status == .downloading else { break }
 
             progress.currentFile = file.filename
@@ -103,49 +105,38 @@ public final class DownloadManager: @unchecked Sendable {
             let destURL = destDir.appendingPathComponent(file.filename)
 
             do {
-                // Use bytes(for:) for streaming download with progress
+                // Track current file progress via delegate
+                currentFileCompletedBytes = completedBytes
+                currentCatalogId = entry.id
+
                 var request = URLRequest(url: url)
                 request.setValue("PrivateAgent/1.0", forHTTPHeaderField: "User-Agent")
 
-                let (asyncBytes, response) = try await session.bytes(for: request)
+                // download(for:) downloads to temp file at full speed, then we move it
+                let (tempURL, response) = try await session.download(for: request)
 
-                guard let httpResponse = response as? HTTPURLResponse,
-                      (200...299).contains(httpResponse.statusCode) else {
+                guard let http = response as? HTTPURLResponse,
+                      (200...299).contains(http.statusCode) else {
                     let code = (response as? HTTPURLResponse)?.statusCode ?? 0
                     throw DownloadError.httpError(filename: file.filename, statusCode: code)
                 }
 
-                // Stream to file
-                let fileHandle = try FileHandle(forWritingTo: {
-                    fm.createFile(atPath: destURL.path, contents: nil)
-                    return destURL
-                }())
-
-                var fileBytes: UInt64 = 0
-                let updateInterval: UInt64 = 512 * 1024  // Update UI every 512KB
-
-                for try await byte in asyncBytes {
-                    try Task.checkCancellation()
-                    fileHandle.write(Data([byte]))
-                    fileBytes += 1
-
-                    if fileBytes % updateInterval == 0 {
-                        progress.bytesDownloaded = completedBytes + fileBytes
-                        await updateProgress(entry.id, progress)
-                    }
+                // Move temp file to final destination
+                if fm.fileExists(atPath: destURL.path) {
+                    try fm.removeItem(at: destURL)
                 }
-                try fileHandle.close()
+                try fm.moveItem(at: tempURL, to: destURL)
 
-                // Verify checksum if available
-                if let sha = file.sha256, !sha.isEmpty {
-                    let valid = try DownloadManager.verifySHA256(fileURL: destURL, expected: sha)
-                    if !valid {
-                        try? fm.removeItem(at: destURL)
-                        throw DownloadError.sha256Mismatch(filename: file.filename)
-                    }
+                // Get actual downloaded size
+                let actualSize: UInt64
+                if let attrs = try? fm.attributesOfItem(atPath: destURL.path),
+                   let size = attrs[.size] as? UInt64 {
+                    actualSize = size
+                } else {
+                    actualSize = file.sizeBytes
                 }
 
-                completedBytes += fileBytes
+                completedBytes += actualSize
                 progress.filesCompleted += 1
                 progress.bytesDownloaded = completedBytes
                 await updateProgress(entry.id, progress)
@@ -156,33 +147,30 @@ public final class DownloadManager: @unchecked Sendable {
                 return
             } catch {
                 progress.status = .failed
-                progress.currentFile = "Error: \(error.localizedDescription)"
+                progress.currentFile = "\(file.filename): \(error.localizedDescription)"
                 await updateProgress(entry.id, progress)
                 throw error
             }
         }
 
-        // Done
         progress.status = .complete
-        progress.currentFile = ""
+        progress.currentFile = "Download complete"
         await updateProgress(entry.id, progress)
     }
 
-    /// Cancel download for a catalog entry.
     public func cancel(catalogId: String) {
-        currentTask?.cancel()
-        currentTask = nil
+        session.getAllTasks { tasks in
+            tasks.forEach { $0.cancel() }
+        }
         activeDownloads.removeValue(forKey: catalogId)
     }
 
-    /// Check free space.
     public func checkFreeSpace(for entry: CatalogEntry) async throws -> Bool {
         let storage = ModelStorage()
         let available = try await storage.availableSpaceBytes()
         return available >= entry.totalSizeBytes + 1_073_741_824
     }
 
-    /// Verify SHA-256.
     public static func verifySHA256(fileURL: URL, expected: String) throws -> Bool {
         guard !expected.isEmpty else { return true }
         let data = try Data(contentsOf: fileURL, options: .mappedIfSafe)
@@ -193,7 +181,9 @@ public final class DownloadManager: @unchecked Sendable {
 
     // MARK: Private
 
-    private var currentTask: Task<Void, Never>?
+    private var session: URLSession!
+    private var currentFileCompletedBytes: UInt64 = 0
+    private var currentCatalogId: String?
 
     @MainActor
     private func updateProgress(_ catalogId: String, _ progress: DownloadProgress) {
@@ -202,6 +192,36 @@ public final class DownloadManager: @unchecked Sendable {
 
     private func huggingFaceURL(repoId: String, filename: String) -> URL {
         URL(string: "https://huggingface.co/\(repoId)/resolve/main/\(filename)")!
+    }
+}
+
+// MARK: - URLSessionDownloadDelegate (for per-file progress)
+
+extension DownloadManager: URLSessionDownloadDelegate {
+    public func urlSession(
+        _ session: URLSession,
+        downloadTask: URLSessionDownloadTask,
+        didFinishDownloadingTo location: URL
+    ) {
+        // Handled by the await session.download(for:) return value
+    }
+
+    public func urlSession(
+        _ session: URLSession,
+        downloadTask: URLSessionDownloadTask,
+        didWriteData bytesWritten: Int64,
+        totalBytesWritten: Int64,
+        totalBytesExpectedToWrite: Int64
+    ) {
+        guard let catalogId = currentCatalogId else { return }
+        let totalNow = currentFileCompletedBytes + UInt64(max(0, totalBytesWritten))
+
+        DispatchQueue.main.async {
+            if var progress = self.activeDownloads[catalogId] {
+                progress.bytesDownloaded = totalNow
+                self.activeDownloads[catalogId] = progress
+            }
+        }
     }
 }
 
