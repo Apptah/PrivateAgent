@@ -21,13 +21,13 @@ final class ChatViewModel {
     private var generationTask: Task<Void, Never>?
     private var lastBatchTime: Date = .distantPast
 
+    private var needsReset = true
+
     init(conversationId: UUID, modelContext: ModelContext, engine: PrivateAgentEngine) {
         self.conversationId = conversationId
         self.modelContext = modelContext
         self.engine = engine
         loadConversation()
-        // Reset KV cache — this conversation may differ from whatever was cached
-        engine.resetConversation()
     }
 
     private func loadConversation() {
@@ -125,6 +125,12 @@ final class ChatViewModel {
         streamingText = ""
         currentStats = ""
         lastBatchTime = Date()
+
+        // Reset KV cache if this is a new/switched conversation
+        if needsReset {
+            engine.resetConversation()
+            needsReset = false
+        }
 
         let stream: AsyncThrowingStream<GenerationEvent, Error>
         if engine.turnCount > 0 {
@@ -227,6 +233,11 @@ final class ChatViewModel {
             self.streamingText = ""
             _ = inThinking  // suppress unused warning
         }
+    }
+
+    /// Mark KV cache as stale — next send will do a full generate.
+    func invalidateCache() {
+        needsReset = true
     }
 
     func cancel() {

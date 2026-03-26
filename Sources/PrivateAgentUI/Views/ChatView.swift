@@ -129,7 +129,9 @@ struct ChatView: View {
             #endif
         }
         .sheet(isPresented: $showSystemPrompt) {
-            SystemPromptSheet(conversation: viewModel.conversation)
+            SystemPromptSheet(conversation: viewModel.conversation) {
+                viewModel.invalidateCache()
+            }
         }
     }
 }
@@ -138,6 +140,7 @@ struct ChatView: View {
 
 private struct SystemPromptSheet: View {
     let conversation: Conversation?
+    var onSave: (() -> Void)?
     @Environment(\.dismiss) private var dismiss
     @State private var draft: String = ""
 
@@ -167,6 +170,7 @@ private struct SystemPromptSheet: View {
                 ToolbarItem(placement: .confirmationAction) {
                     Button("Save") {
                         conversation?.systemPrompt = draft
+                        onSave?()
                         dismiss()
                     }
                 }
