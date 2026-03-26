@@ -6,6 +6,9 @@ struct ModelManagerView: View {
     @State private var downloadManager = DownloadManager()
     @State private var availableSpace: String = "—"
     @State private var errorMessage: String?
+    @State private var downloadedModelIds: Set<String> = []
+    @State private var confirmingDeleteId: String?
+    @AppStorage("selectedModelId") private var selectedModelId: String = ""
 
     var body: some View {
         List {
@@ -22,8 +25,12 @@ struct ModelManagerView: View {
                     ModelRow(
                         entry: entry,
                         progress: downloadManager.activeDownloads[entry.id],
+                        isDownloaded: downloadedModelIds.contains(entry.id),
+                        isSelected: selectedModelId == entry.id,
                         onDownload: { startDownload(entry) },
-                        onCancel: { cancelDownload(entry.id) }
+                        onCancel: { cancelDownload(entry.id) },
+                        onDelete: { confirmingDeleteId = entry.id },
+                        onSelect: { selectedModelId = entry.id }
                     )
                 }
             }
@@ -35,8 +42,40 @@ struct ModelManagerView: View {
         .navigationTitle("Models")
         .task {
             catalogEntries = await ModelCatalog.shared.entries
-            if let bytes = try? await ModelStorage().availableSpaceBytes() {
-                availableSpace = String(format: "%.1f GB", Double(bytes) / 1_073_741_824)
+            await refreshState()
+        }
+        .alert("Delete Model", isPresented: .init(
+            get: { confirmingDeleteId != nil },
+            set: { if !$0 { confirmingDeleteId = nil } }
+        )) {
+            Button("Delete", role: .destructive) {
+                if let id = confirmingDeleteId {
+                    deleteModel(id)
+                }
+            }
+            Button("Cancel", role: .cancel) {
+                confirmingDeleteId = nil
+            }
+        } message: {
+            if let id = confirmingDeleteId,
+               let entry = catalogEntries.first(where: { $0.id == id }) {
+                Text("Delete \(entry.displayName) and free up \(String(format: "%.1f GB", entry.totalSizeGB))? You can re-download it later.")
+            } else {
+                Text("Are you sure you want to delete this model?")
+            }
+        }
+    }
+
+    private func refreshState() async {
+        let storage = ModelStorage()
+        if let bytes = try? await storage.availableSpaceBytes() {
+            availableSpace = String(format: "%.1f GB", Double(bytes) / 1_073_741_824)
+        }
+        if let models = try? await storage.listModels() {
+            downloadedModelIds = Set(models.map { $0.lastPathComponent })
+            // Auto-select if no selection or current selection was deleted
+            if !downloadedModelIds.contains(selectedModelId) {
+                selectedModelId = downloadedModelIds.first ?? ""
             }
         }
     }
@@ -46,6 +85,7 @@ struct ModelManagerView: View {
         Task {
             do {
                 try await downloadManager.download(entry: entry)
+                await refreshState()
             } catch {
                 errorMessage = error.localizedDescription
             }
@@ -55,6 +95,18 @@ struct ModelManagerView: View {
     private func cancelDownload(_ catalogId: String) {
         downloadManager.cancel(catalogId: catalogId)
     }
+
+    private func deleteModel(_ catalogId: String) {
+        Task {
+            do {
+                try await ModelStorage().deleteModel(catalogId: catalogId)
+                downloadManager.cancel(catalogId: catalogId)
+                await refreshState()
+            } catch {
+                errorMessage = "Failed to delete: \(error.localizedDescription)"
+            }
+        }
+    }
 }
 
 // MARK: - Model Row
@@ -62,14 +114,33 @@ struct ModelManagerView: View {
 private struct ModelRow: View {
     let entry: CatalogEntry
     let progress: DownloadManager.DownloadProgress?
+    let isDownloaded: Bool
+    let isSelected: Bool
     let onDownload: () -> Void
     let onCancel: () -> Void
+    let onDelete: () -> Void
+    let onSelect: () -> Void
+
+    private var isReady: Bool {
+        isDownloaded || progress?.status == .complete
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
             HStack {
                 VStack(alignment: .leading, spacing: 2) {
-                    Text(entry.displayName).font(.headline)
+                    HStack(spacing: 6) {
+                        Text(entry.displayName).font(.headline)
+                        if isSelected && isReady {
+                            Text("Active")
+                                .font(.caption2)
+                                .fontWeight(.semibold)
+                                .foregroundStyle(.white)
+                                .padding(.horizontal, 6)
+                                .padding(.vertical, 2)
+                                .background(.blue, in: Capsule())
+                        }
+                    }
                     Text(entry.description)
                         .font(.caption)
                         .foregroundStyle(.secondary)
@@ -86,13 +157,36 @@ private struct ModelRow: View {
                         }
                         .buttonStyle(.plain)
                     case .complete:
-                        Image(systemName: "checkmark.circle.fill")
-                            .foregroundStyle(.green)
+                        HStack(spacing: 8) {
+                            if !isSelected {
+                                Button("Use", action: onSelect)
+                                    .buttonStyle(.bordered)
+                                    .controlSize(.small)
+                            }
+                            Button(action: onDelete) {
+                                Image(systemName: "trash")
+                                    .foregroundStyle(.red)
+                            }
+                            .buttonStyle(.plain)
+                        }
                     case .failed:
                         Image(systemName: "exclamationmark.circle.fill")
                             .foregroundStyle(.red)
                     default:
                         ProgressView()
+                    }
+                } else if isDownloaded {
+                    HStack(spacing: 8) {
+                        if !isSelected {
+                            Button("Use", action: onSelect)
+                                .buttonStyle(.bordered)
+                                .controlSize(.small)
+                        }
+                        Button(action: onDelete) {
+                            Image(systemName: "trash")
+                                .foregroundStyle(.red)
+                        }
+                        .buttonStyle(.plain)
                     }
                 } else {
                     Button("Download", action: onDownload)

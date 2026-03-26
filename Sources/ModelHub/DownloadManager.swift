@@ -173,6 +173,7 @@ public final class DownloadManager: NSObject, @unchecked Sendable {
         activeDownloads.removeValue(forKey: catalogId)
     }
 
+
     public func checkFreeSpace(for entry: CatalogEntry) async throws -> Bool {
         let storage = ModelStorage()
         let available = try await storage.availableSpaceBytes()
