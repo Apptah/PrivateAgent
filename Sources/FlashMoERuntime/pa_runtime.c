@@ -5,6 +5,10 @@
 #include <time.h>
 #include <unistd.h>
 
+#ifdef PA_USE_REAL_ENGINE
+#include "FlashMoEEngine.h"
+#endif
+
 struct PA_Session {
     PA_SessionState state;
     PA_ModelDesc model_desc;
@@ -14,6 +18,9 @@ struct PA_Session {
     int cancelled;
     int32_t turn_count;
     PA_GenerationStats last_gen_stats;
+#ifdef PA_USE_REAL_ENGINE
+    void *engine_ctx;  // FlashMoEContext* (void* to avoid header dependency issues)
+#endif
 };
 
 PA_Session *pa_session_create(void) {
@@ -26,6 +33,16 @@ PA_Session *pa_session_create(void) {
 
 void pa_session_destroy(PA_Session *session) {
     if (!session) return;
+#ifdef PA_USE_REAL_ENGINE
+    if (session->engine_ctx) {
+        FlashMoEContext *ctx = (FlashMoEContext *)session->engine_ctx;
+        if (session->model_loaded) {
+            flashmoe_unload(ctx);
+        }
+        flashmoe_destroy(ctx);
+        session->engine_ctx = NULL;
+    }
+#endif
     free(session);
 }
 
@@ -60,6 +77,42 @@ int pa_session_load_model(PA_Session *session, const PA_ModelDesc *desc, uint64_
         return status;
     }
 
+#ifdef PA_USE_REAL_ENGINE
+    // Destroy any existing engine context
+    if (session->engine_ctx) {
+        FlashMoEContext *old_ctx = (FlashMoEContext *)session->engine_ctx;
+        if (session->model_loaded) {
+            flashmoe_unload(old_ctx);
+        }
+        flashmoe_destroy(old_ctx);
+        session->engine_ctx = NULL;
+    }
+
+    FlashMoEContext *ctx = flashmoe_create();
+    if (!ctx) {
+        snprintf(session->last_error, sizeof(session->last_error), "Engine create failed");
+        session->state = PA_SESSION_IDLE;
+        return PA_STATUS_ERROR_LOAD_FAILED;
+    }
+
+    FlashMoEConfig fmConfig = {0};
+    fmConfig.model_path = desc->model_dir;
+    fmConfig.max_context = (int)session->memory_budget.max_context_length;
+    fmConfig.think_budget = desc->think_budget;
+    fmConfig.verbose = 0;
+
+    int loadResult = flashmoe_load(ctx, &fmConfig);
+    if (loadResult != 0) {
+        snprintf(session->last_error, sizeof(session->last_error),
+            "Engine load failed: %s", flashmoe_last_error(ctx));
+        flashmoe_destroy(ctx);
+        session->state = PA_SESSION_IDLE;
+        return PA_STATUS_ERROR_LOAD_FAILED;
+    }
+
+    session->engine_ctx = ctx;
+#endif
+
     session->model_loaded = 1;
     session->state = PA_SESSION_DONE;
     snprintf(session->last_error, sizeof(session->last_error), "No error");
@@ -68,6 +121,14 @@ int pa_session_load_model(PA_Session *session, const PA_ModelDesc *desc, uint64_
 
 void pa_session_unload_model(PA_Session *session) {
     if (!session) return;
+#ifdef PA_USE_REAL_ENGINE
+    if (session->engine_ctx) {
+        FlashMoEContext *ctx = (FlashMoEContext *)session->engine_ctx;
+        flashmoe_unload(ctx);
+        flashmoe_destroy(ctx);
+        session->engine_ctx = NULL;
+    }
+#endif
     session->model_loaded = 0;
     memset(&session->model_desc, 0, sizeof(PA_ModelDesc));
     memset(&session->memory_budget, 0, sizeof(PA_MemoryBudget));
@@ -90,12 +151,72 @@ static double timespec_to_ms(const struct timespec *ts) {
     return (double)ts->tv_sec * 1000.0 + (double)ts->tv_nsec / 1.0e6;
 }
 
+// ---- Callback bridge: PA_TokenCallback → FlashMoETokenCallback ----
+
+struct pa_callback_bridge {
+    PA_TokenCallback user_callback;
+    void *user_data;
+};
+
+#ifdef PA_USE_REAL_ENGINE
+static int pa_bridge_callback(const char *text, int id, int generated, double tps, void *ud) {
+    struct pa_callback_bridge *bridge = (struct pa_callback_bridge *)ud;
+    if (!bridge->user_callback) return 0;
+    return bridge->user_callback(text, (int32_t)id, (int32_t)generated, tps, bridge->user_data);
+}
+#endif
+
 int pa_session_generate(PA_Session *session, const char *prompt,
                         const PA_GenerationConfig *config,
                         PA_TokenCallback callback, void *user_data) {
     if (!session || !prompt) return PA_STATUS_ERROR_GENERIC;
 
     session->cancelled = 0;
+
+#ifdef PA_USE_REAL_ENGINE
+    if (!session->engine_ctx) {
+        snprintf(session->last_error, sizeof(session->last_error), "No engine loaded");
+        return PA_STATUS_ERROR_GENERIC;
+    }
+
+    FlashMoEContext *ctx = (FlashMoEContext *)session->engine_ctx;
+    struct pa_callback_bridge bridge = { callback, user_data };
+
+    int max_tokens = config ? (int)config->max_tokens : 512;
+
+    session->state = PA_SESSION_PREFILL;
+    int result = flashmoe_generate(ctx, prompt, max_tokens, pa_bridge_callback, &bridge);
+
+    if (session->cancelled) {
+        session->state = PA_SESSION_CANCELLED;
+        return PA_STATUS_OK;
+    }
+
+    if (result < 0) {
+        snprintf(session->last_error, sizeof(session->last_error),
+            "Generation failed: %s", flashmoe_last_error(ctx));
+        session->state = PA_SESSION_DONE;
+        return PA_STATUS_ERROR_GENERIC;
+    }
+
+    // Pull stats from engine
+    FlashMoEStats fmStats = {0};
+    flashmoe_get_stats(ctx, &fmStats);
+
+    session->last_gen_stats.tokens_per_second  = fmStats.tokens_per_second;
+    session->last_gen_stats.tokens_generated   = (int32_t)fmStats.tokens_generated;
+    session->last_gen_stats.total_time_ms      = fmStats.total_time_ms;
+    session->last_gen_stats.ttft_ms            = fmStats.ttft_ms;
+    session->last_gen_stats.prefill_ms         = fmStats.prefill_ms;
+    session->last_gen_stats.prefill_tokens     = (int32_t)fmStats.prefill_tokens;
+    session->last_gen_stats.prefill_tps        = fmStats.prefill_tps;
+    session->last_gen_stats.peak_memory_bytes  = (uint64_t)fmStats.metal_buffer_bytes;
+
+    session->turn_count++;
+    session->state = PA_SESSION_DONE;
+    return PA_STATUS_OK;
+
+#else  // PA_USE_REAL_ENGINE not defined → mock path
 
     // Mock prefill
     session->state = PA_SESSION_PREFILL;
@@ -165,17 +286,73 @@ int pa_session_generate(PA_Session *session, const char *prompt,
     session->turn_count++;
     session->state = PA_SESSION_DONE;
     return PA_STATUS_OK;
+
+#endif  // PA_USE_REAL_ENGINE
 }
 
 int pa_session_generate_continuation(PA_Session *session, const char *user_message,
                                      const PA_GenerationConfig *config,
                                      PA_TokenCallback callback, void *user_data) {
+#ifdef PA_USE_REAL_ENGINE
+    if (!session || !user_message) return PA_STATUS_ERROR_GENERIC;
+    if (!session->engine_ctx) {
+        snprintf(session->last_error, sizeof(session->last_error), "No engine loaded");
+        return PA_STATUS_ERROR_GENERIC;
+    }
+
+    session->cancelled = 0;
+
+    FlashMoEContext *ctx = (FlashMoEContext *)session->engine_ctx;
+    struct pa_callback_bridge bridge = { callback, user_data };
+
+    int max_tokens = config ? (int)config->max_tokens : 512;
+
+    session->state = PA_SESSION_PREFILL;
+    int result = flashmoe_generate_continuation(ctx, user_message, max_tokens,
+                                                pa_bridge_callback, &bridge);
+
+    if (session->cancelled) {
+        session->state = PA_SESSION_CANCELLED;
+        return PA_STATUS_OK;
+    }
+
+    if (result < 0) {
+        snprintf(session->last_error, sizeof(session->last_error),
+            "Continuation failed: %s", flashmoe_last_error(ctx));
+        session->state = PA_SESSION_DONE;
+        return PA_STATUS_ERROR_GENERIC;
+    }
+
+    // Pull stats from engine
+    FlashMoEStats fmStats = {0};
+    flashmoe_get_stats(ctx, &fmStats);
+
+    session->last_gen_stats.tokens_per_second  = fmStats.tokens_per_second;
+    session->last_gen_stats.tokens_generated   = (int32_t)fmStats.tokens_generated;
+    session->last_gen_stats.total_time_ms      = fmStats.total_time_ms;
+    session->last_gen_stats.ttft_ms            = fmStats.ttft_ms;
+    session->last_gen_stats.prefill_ms         = fmStats.prefill_ms;
+    session->last_gen_stats.prefill_tokens     = (int32_t)fmStats.prefill_tokens;
+    session->last_gen_stats.prefill_tps        = fmStats.prefill_tps;
+    session->last_gen_stats.peak_memory_bytes  = (uint64_t)fmStats.metal_buffer_bytes;
+
+    session->turn_count++;
+    session->state = PA_SESSION_DONE;
+    return PA_STATUS_OK;
+
+#else
     return pa_session_generate(session, user_message, config, callback, user_data);
+#endif
 }
 
 void pa_session_cancel(PA_Session *session) {
     if (!session) return;
     session->cancelled = 1;
+#ifdef PA_USE_REAL_ENGINE
+    if (session->engine_ctx) {
+        flashmoe_cancel((FlashMoEContext *)session->engine_ctx);
+    }
+#endif
 }
 
 void pa_session_reset(PA_Session *session) {
@@ -184,6 +361,11 @@ void pa_session_reset(PA_Session *session) {
     memset(&session->last_gen_stats, 0, sizeof(PA_GenerationStats));
     session->cancelled = 0;
     session->state = PA_SESSION_IDLE;
+#ifdef PA_USE_REAL_ENGINE
+    if (session->engine_ctx) {
+        flashmoe_reset((FlashMoEContext *)session->engine_ctx);
+    }
+#endif
 }
 
 int pa_session_get_gen_stats(const PA_Session *session, PA_GenerationStats *out_stats) {
