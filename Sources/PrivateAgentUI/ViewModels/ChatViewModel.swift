@@ -72,7 +72,15 @@ final class ChatViewModel {
         let storage = ModelStorage()
         let models = (try? await storage.listModels()) ?? []
         print("[CHAT] Found \(models.count) model(s): \(models.map { $0.lastPathComponent })")
-        guard let modelDir = models.first else {
+
+        let selectedId = UserDefaults.standard.string(forKey: "selectedModelId") ?? ""
+        let modelDir: URL
+        if !selectedId.isEmpty,
+           let selected = models.first(where: { $0.lastPathComponent == selectedId }) {
+            modelDir = selected
+        } else if let first = models.first {
+            modelDir = first
+        } else {
             print("[CHAT] ❌ No models found!")
             currentStats = "No model downloaded. Go to Models to download one."
             return
@@ -126,27 +134,26 @@ final class ChatViewModel {
         currentStats = ""
         lastBatchTime = Date()
 
-        // Reset KV cache if this is a new/switched conversation
-        if needsReset {
+        // Decide: continuation (reuse KV cache) vs independent (reset + fresh prompt)
+        let isFollowUp = engine.turnCount > 0 && looksLikeFollowUp(text)
+
+        if needsReset || (engine.turnCount > 0 && !isFollowUp) {
             engine.resetConversation()
             needsReset = false
+            print("[CHAT] KV cache reset (needsReset=\(needsReset), isFollowUp=\(isFollowUp))")
         }
 
         let stream: AsyncThrowingStream<GenerationEvent, Error>
-        if engine.turnCount > 0 {
-            print("[CHAT] Using continuation (turn \(engine.turnCount)), user text only")
+        if isFollowUp {
+            print("[CHAT] Using continuation (turn \(engine.turnCount)), follow-up detected")
             stream = engine.generateContinuation(text)
         } else {
-            print("[CHAT] Using full generate (turn 0), compiling full prompt")
+            print("[CHAT] Using full generate (independent question), system prompt only")
             let systemPrompt = conversation.systemPrompt
-            let history = sortedMessages
-                .filter { $0.id != assistantMessage.id }
-                .map { ChatMessage(role: $0.role.rawValue, content: $0.content) }
-
             var chatMessages: [ChatMessage] = [
-                ChatMessage(role: "system", content: systemPrompt)
+                ChatMessage(role: "system", content: systemPrompt),
+                ChatMessage(role: "user", content: text)
             ]
-            chatMessages.append(contentsOf: history)
             let prompt = PromptCompiler.compile(messages: chatMessages, addGenerationPrompt: true)
             stream = engine.generate(.formattedPrompt(prompt))
         }
@@ -238,6 +245,39 @@ final class ChatViewModel {
     /// Mark KV cache as stale — next send will do a full generate.
     func invalidateCache() {
         needsReset = true
+    }
+
+    /// Heuristic: does this message look like a follow-up to the previous conversation?
+    /// Returns true if it contains referential language or is a short continuation-style query.
+    private func looksLikeFollowUp(_ text: String) -> Bool {
+        let lower = text.lowercased()
+
+        // Referential patterns (Chinese + English)
+        let followUpPatterns = [
+            // Chinese referential
+            "這個", "那個", "這些", "那些", "上面", "剛才", "之前",
+            "繼續", "接著", "然後", "為什麼", "怎麼", "可以再",
+            "補充", "詳細", "解釋一下", "舉個例", "比如",
+            "還有", "另外", "除此之外",
+            // Chinese pronouns referencing prior context
+            "它", "他們", "她們", "它們",
+            // English referential
+            "this", "that", "these", "those", "above", "previous",
+            "continue", "go on", "follow up", "elaborate", "explain more",
+            "why did", "how does", "what about", "can you",
+            "also", "additionally", "furthermore",
+            // Short affirmations expecting continuation
+            "yes", "ok", "好", "對", "是的", "沒錯",
+        ]
+
+        for pattern in followUpPatterns {
+            if lower.contains(pattern) { return true }
+        }
+
+        // Very short messages (< 10 chars) after an existing conversation are likely follow-ups
+        if text.count < 10 { return true }
+
+        return false
     }
 
     func cancel() {
