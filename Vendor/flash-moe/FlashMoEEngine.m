@@ -12,8 +12,8 @@
 
 // Unity build — include the entire inference engine
 // This gives us access to all static functions and globals
-#include "../../metal_infer/infer.m"
-#include "../../metal_infer/batched_prefill.h"
+#include "infer.m"
+#include "batched_prefill.h"
 
 #include "FlashMoEEngine.h"
 #include <stdatomic.h>

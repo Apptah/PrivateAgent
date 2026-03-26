@@ -58,10 +58,29 @@ let package = Package(
             ]
         ),
 
+        // ── Vendored flash-moe engine (unity build) ──
+        .target(
+            name: "FlashMoEVendor",
+            dependencies: ["FlashMoECore"],
+            path: "Vendor/flash-moe",
+            sources: ["FlashMoEEngine.m"],
+            publicHeadersPath: ".",
+            cSettings: [
+                .headerSearchPath("."),
+                .define("CHAT_MODE", to: "1"),
+                .define("ACCELERATE_NEW_LAPACK"),
+            ],
+            linkerSettings: [
+                .linkedFramework("Metal"),
+                .linkedFramework("Accelerate"),
+                .linkedLibrary("compression"),
+            ]
+        ),
+
         // ── Runtime ──
         .target(
             name: "FlashMoERuntime",
-            dependencies: ["FlashMoECore", "FlashMoEMetal", "TurboQuantCore", "TurboQuantMetal"],
+            dependencies: ["FlashMoECore", "FlashMoEMetal", "TurboQuantCore", "TurboQuantMetal", "FlashMoEVendor"],
             path: "Sources/FlashMoERuntime",
             publicHeadersPath: "include",
             linkerSettings: [
