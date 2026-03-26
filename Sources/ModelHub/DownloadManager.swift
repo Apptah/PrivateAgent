@@ -105,21 +105,14 @@ public final class DownloadManager: NSObject, @unchecked Sendable {
             let destURL = destDir.appendingPathComponent(file.filename)
 
             do {
-                // Track current file progress via delegate
                 currentFileCompletedBytes = completedBytes
                 currentCatalogId = entry.id
 
-                var request = URLRequest(url: url)
-                request.setValue("PrivateAgent/1.0", forHTTPHeaderField: "User-Agent")
-
-                // download(for:) downloads to temp file at full speed, then we move it
-                let (tempURL, response) = try await session.download(for: request)
-
-                guard let http = response as? HTTPURLResponse,
-                      (200...299).contains(http.statusCode) else {
-                    let code = (response as? HTTPURLResponse)?.statusCode ?? 0
-                    throw DownloadError.httpError(filename: file.filename, statusCode: code)
-                }
+                let tempURL = try await downloadFileWithRetry(
+                    url: url,
+                    filename: file.filename,
+                    maxRetries: 5
+                )
 
                 // Move temp file to final destination
                 if fm.fileExists(atPath: destURL.path) {
@@ -184,6 +177,57 @@ public final class DownloadManager: NSObject, @unchecked Sendable {
     private var session: URLSession!
     private var currentFileCompletedBytes: UInt64 = 0
     private var currentCatalogId: String?
+
+    /// Download a single file with automatic retry + resume on network errors.
+    private func downloadFileWithRetry(url: URL, filename: String, maxRetries: Int) async throws -> URL {
+        var request = URLRequest(url: url)
+        request.setValue("PrivateAgent/1.0", forHTTPHeaderField: "User-Agent")
+        request.timeoutInterval = 300  // 5 min timeout per request
+
+        var resumeData: Data?
+        var lastError: Error?
+
+        for attempt in 0...maxRetries {
+            do {
+                let (tempURL, response): (URL, URLResponse)
+
+                if let data = resumeData {
+                    // Resume from where we left off
+                    (tempURL, response) = try await session.download(resumeFrom: data)
+                } else {
+                    (tempURL, response) = try await session.download(for: request)
+                }
+
+                guard let http = response as? HTTPURLResponse,
+                      (200...299).contains(http.statusCode) else {
+                    let code = (response as? HTTPURLResponse)?.statusCode ?? 0
+                    throw DownloadError.httpError(filename: filename, statusCode: code)
+                }
+
+                return tempURL
+
+            } catch let error as NSError where error.code == -1005 || error.code == -1001 || error.code == -1009 {
+                // -1005: connection lost, -1001: timeout, -1009: no internet
+                lastError = error
+
+                // Extract resume data if available
+                if let data = error.userInfo[NSURLSessionDownloadTaskResumeData] as? Data {
+                    resumeData = data
+                }
+
+                if attempt < maxRetries {
+                    // Wait before retry: 2, 4, 8, 16, 32 seconds
+                    let delay = UInt64(pow(2.0, Double(attempt + 1)))
+                    try await Task.sleep(for: .seconds(delay))
+                    continue
+                }
+            } catch {
+                throw error
+            }
+        }
+
+        throw lastError ?? DownloadError.httpError(filename: filename, statusCode: 0)
+    }
 
     @MainActor
     private func updateProgress(_ catalogId: String, _ progress: DownloadProgress) {
