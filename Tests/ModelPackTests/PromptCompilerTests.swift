@@ -13,8 +13,7 @@ struct PromptCompilerTests {
         #expect(prompt.contains("<|im_start|>system\nYou are helpful.<|im_end|>"))
         #expect(prompt.contains("<|im_start|>user\nHello<|im_end|>"))
         #expect(prompt.contains("<|im_start|>assistant\n"))
-        // Default: thinking disabled, empty think block appended
-        #expect(prompt.hasSuffix("<think>\n</think>\n"))
+        #expect(prompt.hasSuffix("<|im_start|>assistant\n"))
     }
 
     @Test("Multi-turn conversation")
@@ -27,7 +26,7 @@ struct PromptCompilerTests {
         ]
         let prompt = PromptCompiler.compile(messages: messages)
         #expect(prompt.contains("<|im_start|>assistant\nHello!<|im_end|>"))
-        #expect(prompt.hasSuffix("<think>\n</think>\n"))
+        #expect(prompt.hasSuffix("<|im_start|>assistant\n"))
     }
 
     @Test("No generation prompt")
