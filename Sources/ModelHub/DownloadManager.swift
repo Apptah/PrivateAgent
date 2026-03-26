@@ -5,10 +5,8 @@ import CryptoKit
 import Foundation
 import Observation
 
-// MARK: - DownloadManager
-
 @Observable
-public final class DownloadManager: NSObject {
+public final class DownloadManager: @unchecked Sendable {
 
     // MARK: - DownloadProgress
 
@@ -30,27 +28,13 @@ public final class DownloadManager: NSObject {
 
     // MARK: Lifecycle
 
-    public override init() {
-        let config = URLSessionConfiguration.background(
-            withIdentifier: "com.privateagent.downloads"
-        )
-        config.isDiscretionary = false
-        config.sessionSendsLaunchEvents = true
-
-        // Placeholder; real session assigned after super.init()
-        _session = nil
-        super.init()
-        _session = URLSession(configuration: config, delegate: self, delegateQueue: nil)
-    }
+    public init() {}
 
     // MARK: Public
 
-    /// Active in-progress downloads keyed by catalogId.
     public private(set) var activeDownloads: [String: DownloadProgress] = [:]
 
-    // MARK: - Download lifecycle
-
-    /// Begin downloading all files for the given catalog entry.
+    /// Download all files for a catalog entry sequentially with progress.
     public func download(entry: CatalogEntry) async throws {
         guard try await checkFreeSpace(for: entry) else {
             throw DownloadError.insufficientDiskSpace
@@ -61,7 +45,7 @@ public final class DownloadManager: NSObject {
         let fm = FileManager.default
         try fm.createDirectory(at: destDir, withIntermediateDirectories: true)
 
-        // Pre-create subdirectories for expert files (e.g. packed_experts/, packed_experts_tiered/)
+        // Pre-create subdirectories
         for file in entry.files {
             let fileURL = destDir.appendingPathComponent(file.filename)
             let parentDir = fileURL.deletingLastPathComponent()
@@ -70,89 +54,137 @@ public final class DownloadManager: NSObject {
             }
         }
 
+        // Initialize progress
         var progress = DownloadProgress(
             catalogId: entry.id,
             displayName: entry.displayName,
-            currentFile: entry.files.first?.filename ?? "",
+            currentFile: "",
             filesCompleted: 0,
             filesTotal: entry.files.count,
             bytesDownloaded: 0,
             bytesTotal: entry.totalSizeBytes,
             status: .downloading
         )
-        activeDownloads[entry.id] = progress
-        completedBytes[entry.id] = 0
 
-        await stateStore.set(DownloadState(
-            catalogId: entry.id,
-            totalFiles: entry.files.count,
-            completedFiles: 0,
-            totalBytes: entry.totalSizeBytes,
-            downloadedBytes: 0,
-            status: .downloading,
-            lastUpdated: Date()
-        ))
-
+        // Check which files already exist
+        var completedBytes: UInt64 = 0
+        var filesToDownload: [ModelFile] = []
         for file in entry.files {
-            // Skip files already fully downloaded
             let destURL = destDir.appendingPathComponent(file.filename)
-            if FileManager.default.fileExists(atPath: destURL.path) {
+            if fm.fileExists(atPath: destURL.path) {
+                // Skip already downloaded files
                 progress.filesCompleted += 1
-                progress.bytesDownloaded += file.sizeBytes
-                progress.currentFile = file.filename
-                activeDownloads[entry.id] = progress
-                continue
+                completedBytes += file.sizeBytes
+            } else {
+                filesToDownload.append(file)
             }
-
-            let downloadURL = huggingFaceURL(repoId: entry.repoId, filename: file.filename)
-            var request = URLRequest(url: downloadURL)
-            request.setValue("PrivateAgent/1.0", forHTTPHeaderField: "User-Agent")
-
-            let task = session.downloadTask(with: request)
-            // Encode metadata into task description for delegate recovery
-            task.taskDescription = [
-                entry.id,
-                file.filename,
-                "\(file.sizeBytes)",
-                file.sha256 ?? "",
-            ].joined(separator: "|")
-
-            taskMap[task.taskIdentifier] = (catalogId: entry.id, file: file, destDir: destDir)
-            task.resume()
         }
+        progress.bytesDownloaded = completedBytes
+        await updateProgress(entry.id, progress)
+
+        if filesToDownload.isEmpty {
+            progress.status = .complete
+            await updateProgress(entry.id, progress)
+            return
+        }
+
+        // Download files sequentially
+        let session = URLSession.shared
+        currentTask = nil
+
+        for file in filesToDownload {
+            // Check cancellation
+            guard await activeDownloads[entry.id]?.status == .downloading else { break }
+
+            progress.currentFile = file.filename
+            await updateProgress(entry.id, progress)
+
+            let url = huggingFaceURL(repoId: entry.repoId, filename: file.filename)
+            let destURL = destDir.appendingPathComponent(file.filename)
+
+            do {
+                // Use bytes(for:) for streaming download with progress
+                var request = URLRequest(url: url)
+                request.setValue("PrivateAgent/1.0", forHTTPHeaderField: "User-Agent")
+
+                let (asyncBytes, response) = try await session.bytes(for: request)
+
+                guard let httpResponse = response as? HTTPURLResponse,
+                      (200...299).contains(httpResponse.statusCode) else {
+                    let code = (response as? HTTPURLResponse)?.statusCode ?? 0
+                    throw DownloadError.httpError(filename: file.filename, statusCode: code)
+                }
+
+                // Stream to file
+                let fileHandle = try FileHandle(forWritingTo: {
+                    fm.createFile(atPath: destURL.path, contents: nil)
+                    return destURL
+                }())
+
+                var fileBytes: UInt64 = 0
+                let updateInterval: UInt64 = 512 * 1024  // Update UI every 512KB
+
+                for try await byte in asyncBytes {
+                    try Task.checkCancellation()
+                    fileHandle.write(Data([byte]))
+                    fileBytes += 1
+
+                    if fileBytes % updateInterval == 0 {
+                        progress.bytesDownloaded = completedBytes + fileBytes
+                        await updateProgress(entry.id, progress)
+                    }
+                }
+                try fileHandle.close()
+
+                // Verify checksum if available
+                if let sha = file.sha256, !sha.isEmpty {
+                    let valid = try DownloadManager.verifySHA256(fileURL: destURL, expected: sha)
+                    if !valid {
+                        try? fm.removeItem(at: destURL)
+                        throw DownloadError.sha256Mismatch(filename: file.filename)
+                    }
+                }
+
+                completedBytes += fileBytes
+                progress.filesCompleted += 1
+                progress.bytesDownloaded = completedBytes
+                await updateProgress(entry.id, progress)
+
+            } catch is CancellationError {
+                progress.status = .paused
+                await updateProgress(entry.id, progress)
+                return
+            } catch {
+                progress.status = .failed
+                progress.currentFile = "Error: \(error.localizedDescription)"
+                await updateProgress(entry.id, progress)
+                throw error
+            }
+        }
+
+        // Done
+        progress.status = .complete
+        progress.currentFile = ""
+        await updateProgress(entry.id, progress)
     }
 
-    /// Cancel all download tasks for the given catalogId.
+    /// Cancel download for a catalog entry.
     public func cancel(catalogId: String) {
-        session.getAllTasks { tasks in
-            for task in tasks {
-                guard let desc = task.taskDescription,
-                      desc.hasPrefix(catalogId + "|")
-                else { continue }
-                task.cancel()
-            }
-        }
+        currentTask?.cancel()
+        currentTask = nil
         activeDownloads.removeValue(forKey: catalogId)
-        Task {
-            await self.stateStore.remove(catalogId)
-        }
     }
 
-    // MARK: - Disk space
-
-    /// Returns true when at least `entry.totalSizeBytes` + 1 GB is available.
+    /// Check free space.
     public func checkFreeSpace(for entry: CatalogEntry) async throws -> Bool {
         let storage = ModelStorage()
         let available = try await storage.availableSpaceBytes()
-        let required = entry.totalSizeBytes + 1_073_741_824 // +1 GB margin
-        return available >= required
+        return available >= entry.totalSizeBytes + 1_073_741_824
     }
 
-    // MARK: - SHA-256 verification
-
-    /// Returns true when the file's SHA-256 digest matches `expected` (hex string).
+    /// Verify SHA-256.
     public static func verifySHA256(fileURL: URL, expected: String) throws -> Bool {
-        guard !expected.isEmpty else { return true } // no checksum to verify
+        guard !expected.isEmpty else { return true }
         let data = try Data(contentsOf: fileURL, options: .mappedIfSafe)
         let digest = SHA256.hash(data: data)
         let hex = digest.compactMap { String(format: "%02x", $0) }.joined()
@@ -161,156 +193,15 @@ public final class DownloadManager: NSObject {
 
     // MARK: Private
 
-    private var _session: URLSession?
-    private var session: URLSession { _session! }
+    private var currentTask: Task<Void, Never>?
 
-    private let stateStore = DownloadStateStore()
-
-    /// Maps URLSession task identifier → (catalogId, file metadata, destination directory).
-    private var taskMap: [Int: (catalogId: String, file: ModelFile, destDir: URL)] = [:]
-
-    /// Tracks cumulative bytes written per active task (by task identifier).
-    private var taskBytesWritten: [Int: Int64] = [:]
-
-    /// Tracks total bytes from completed files per catalog entry.
-    private var completedBytes: [String: UInt64] = [:]
+    @MainActor
+    private func updateProgress(_ catalogId: String, _ progress: DownloadProgress) {
+        activeDownloads[catalogId] = progress
+    }
 
     private func huggingFaceURL(repoId: String, filename: String) -> URL {
-        // https://huggingface.co/<owner>/<repo>/resolve/main/<filename>
         URL(string: "https://huggingface.co/\(repoId)/resolve/main/\(filename)")!
-    }
-}
-
-// MARK: - URLSessionDownloadDelegate
-
-extension DownloadManager: URLSessionDownloadDelegate {
-
-    public func urlSession(
-        _ session: URLSession,
-        downloadTask: URLSessionDownloadTask,
-        didFinishDownloadingTo location: URL
-    ) {
-        guard let info = taskMap[downloadTask.taskIdentifier] else { return }
-        let destURL = info.destDir.appendingPathComponent(info.file.filename)
-
-        do {
-            // Move temp file to final destination
-            if FileManager.default.fileExists(atPath: destURL.path) {
-                try FileManager.default.removeItem(at: destURL)
-            }
-            try FileManager.default.moveItem(at: location, to: destURL)
-
-            // Verify SHA-256 if available
-            if let expectedHash = info.file.sha256, !expectedHash.isEmpty {
-                let valid = try DownloadManager.verifySHA256(fileURL: destURL, expected: expectedHash)
-                if !valid {
-                    try? FileManager.default.removeItem(at: destURL)
-                    markFailed(catalogId: info.catalogId, reason: "SHA-256 mismatch for \(info.file.filename)")
-                    return
-                }
-            }
-
-            // Update progress
-            DispatchQueue.main.async {
-                self.recordFileCompleted(
-                    catalogId: info.catalogId,
-                    file: info.file
-                )
-            }
-        } catch {
-            markFailed(catalogId: info.catalogId, reason: error.localizedDescription)
-        }
-
-        taskBytesWritten.removeValue(forKey: downloadTask.taskIdentifier)
-        taskMap.removeValue(forKey: downloadTask.taskIdentifier)
-    }
-
-    public func urlSession(
-        _ session: URLSession,
-        task: URLSessionTask,
-        didCompleteWithError error: Error?
-    ) {
-        guard let error else { return }
-        guard let info = taskMap[task.taskIdentifier] else { return }
-        taskBytesWritten.removeValue(forKey: task.taskIdentifier)
-        taskMap.removeValue(forKey: task.taskIdentifier)
-        DispatchQueue.main.async {
-            self.markFailed(catalogId: info.catalogId, reason: error.localizedDescription)
-        }
-    }
-
-    public func urlSession(
-        _ session: URLSession,
-        downloadTask: URLSessionDownloadTask,
-        didWriteData bytesWritten: Int64,
-        totalBytesWritten: Int64,
-        totalBytesExpectedToWrite: Int64
-    ) {
-        guard let info = taskMap[downloadTask.taskIdentifier] else { return }
-
-        // Store cumulative bytes for this task
-        taskBytesWritten[downloadTask.taskIdentifier] = totalBytesWritten
-
-        // Compute total: completed files + all active tasks' cumulative bytes
-        let completed = completedBytes[info.catalogId] ?? 0
-        let activeTotal = taskMap
-            .filter { $0.value.catalogId == info.catalogId }
-            .reduce(UInt64(0)) { sum, entry in
-                sum + UInt64(max(0, taskBytesWritten[entry.key] ?? 0))
-            }
-        let totalDownloaded = completed + activeTotal
-        let currentFile = info.file.filename
-
-        DispatchQueue.main.async {
-            if var progress = self.activeDownloads[info.catalogId] {
-                progress.bytesDownloaded = totalDownloaded
-                progress.currentFile = currentFile
-                self.activeDownloads[info.catalogId] = progress
-            }
-        }
-    }
-
-    // MARK: Private helpers
-
-    private func recordFileCompleted(catalogId: String, file: ModelFile) {
-        // Add this file's size to completed bytes tracker
-        completedBytes[catalogId, default: 0] += file.sizeBytes
-
-        if var progress = activeDownloads[catalogId] {
-            progress.filesCompleted += 1
-            progress.bytesDownloaded = completedBytes[catalogId] ?? 0
-
-            if progress.filesCompleted >= progress.filesTotal {
-                progress.status = .complete
-                activeDownloads.removeValue(forKey: catalogId)
-                completedBytes.removeValue(forKey: catalogId)
-            } else {
-                activeDownloads[catalogId] = progress
-            }
-        }
-
-        Task {
-            if var state = await stateStore.get(catalogId) {
-                state.completedFiles += 1
-                state.status = state.completedFiles >= state.totalFiles ? .complete : .downloading
-                state.lastUpdated = Date()
-                await stateStore.set(state)
-            }
-        }
-    }
-
-    private func markFailed(catalogId: String, reason: String) {
-        if var progress = activeDownloads[catalogId] {
-            progress.status = .failed
-            activeDownloads[catalogId] = progress
-        }
-        Task {
-            if var state = await stateStore.get(catalogId) {
-                state.status = .failed
-                state.lastUpdated = Date()
-                await stateStore.set(state)
-            }
-        }
     }
 }
 
@@ -319,13 +210,16 @@ extension DownloadManager: URLSessionDownloadDelegate {
 public enum DownloadError: Error, LocalizedError {
     case insufficientDiskSpace
     case sha256Mismatch(filename: String)
+    case httpError(filename: String, statusCode: Int)
 
     public var errorDescription: String? {
         switch self {
         case .insufficientDiskSpace:
-            return "Not enough free disk space to download this model (requires 1 GB headroom)."
+            return "Not enough free disk space (requires 1 GB headroom)."
         case .sha256Mismatch(let filename):
             return "SHA-256 verification failed for \(filename)."
+        case .httpError(let filename, let code):
+            return "HTTP \(code) downloading \(filename)."
         }
     }
 }
