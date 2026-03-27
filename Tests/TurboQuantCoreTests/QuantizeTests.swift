@@ -94,6 +94,66 @@ struct QuantizeTests {
         #expect(err3 >= err4, "3-bit error (\(err3)) should be >= 4-bit (\(err4))")
     }
 
+    // MARK: - Split quantisation (outlier channel, fractional bit rates)
+
+    @Test("3.5-bit split roundtrip: first half uses 4-bit, second half uses 3-bit")
+    func splitQuantize3_5bit() {
+        let dim = 128
+        // Use same vector as existing 4-bit test (known to work with codebook)
+        let v = makeRotatedUnitVector(dim: dim, seed: 0xCAFE1234)
+        var codes = [UInt8](repeating: 0, count: dim)
+        var output = [Float](repeating: 0, count: dim)
+
+        tq_quantize_lloydmax_split(v, UInt32(dim), &codes, 7)  // 7 = 3.5-bit
+        tq_dequantize_lloydmax_split(codes, &output, UInt32(dim), 7)
+
+        // First half (4-bit): codes should be in 0..15
+        for i in 0..<(dim/2) {
+            #expect(codes[i] < 16, "Hi-half code[\(i)]=\(codes[i]) exceeds 4-bit range")
+        }
+        // Second half (3-bit): codes should be in 0..7
+        for i in (dim/2)..<dim {
+            #expect(codes[i] < 8, "Lo-half code[\(i)]=\(codes[i]) exceeds 3-bit range")
+        }
+
+        let err = maxAbsError(v, output)
+        #expect(err < 0.3, "3.5-bit split max error \(err) exceeds 0.3")
+    }
+
+    @Test("Integer bits_x2 delegates to standard path")
+    func splitQuantizeIntegerFallback() {
+        let dim = 128
+        let v = makeRotatedUnitVector(dim: dim, seed: 0xFA11BACC)
+        var codesSplit = [UInt8](repeating: 0, count: dim)
+        var codesStd   = [UInt8](repeating: 0, count: dim)
+
+        tq_quantize_lloydmax_split(v, UInt32(dim), &codesSplit, 8)  // 8 = 4-bit integer
+        tq_quantize_lloydmax(v, UInt32(dim), &codesStd, 4)
+
+        #expect(codesSplit == codesStd, "Integer bits_x2 should produce same codes as standard")
+    }
+
+    @Test("3.5-bit MSE is between 3-bit and 4-bit MSE")
+    func splitQuantizeAccuracyOrdering() {
+        let dim = 128
+        let v = makeRotatedUnitVector(dim: dim, seed: 0xACCE55ED)
+
+        func mse(bits_x2: UInt16) -> Float {
+            var codes = [UInt8](repeating: 0, count: dim)
+            var output = [Float](repeating: 0, count: dim)
+            tq_quantize_lloydmax_split(v, UInt32(dim), &codes, bits_x2)
+            tq_dequantize_lloydmax_split(codes, &output, UInt32(dim), bits_x2)
+            return zip(v, output).map { ($0.0 - $0.1) * ($0.0 - $0.1) }.reduce(0, +) / Float(dim)
+        }
+
+        let mse3   = mse(bits_x2: 6)  // 3-bit
+        let mse3_5 = mse(bits_x2: 7)  // 3.5-bit
+        let mse4   = mse(bits_x2: 8)  // 4-bit
+
+        #expect(mse3_5 <= mse3, "3.5-bit MSE (\(mse3_5)) should be <= 3-bit (\(mse3))")
+        #expect(mse3_5 >= mse4, "3.5-bit MSE (\(mse3_5)) should be >= 4-bit (\(mse4))")
+    }
+
     // MARK: - QJL encode sanity (via new API)
 
     @Test("tq_qjl_encode produces non-trivial packed bits")

@@ -124,6 +124,121 @@ struct TransformTests {
         }
     }
 
+    // MARK: - WHT init
+
+    @Test("tq_wht_init succeeds for power-of-2 dim")
+    func whtInitSucceeds() {
+        let ret = tq_wht_init(dim, seed)
+        #expect(ret == 0, "tq_wht_init returned \(ret)")
+        tq_wht_cleanup()
+    }
+
+    @Test("tq_wht_init fails for non-power-of-2 dim")
+    func whtInitFailsNonPow2() {
+        let ret = tq_wht_init(31, seed)
+        #expect(ret == -1, "Should fail for non-power-of-2 dim")
+    }
+
+    // MARK: - WHT invertibility
+
+    @Test("WHT rotate then inverse recovers original")
+    func whtIsInvertible() {
+        let x = makeVector(dim: dim)
+        tq_wht_init(dim, seed)
+
+        var y = [Float](repeating: 0, count: Int(dim))
+        var z = [Float](repeating: 0, count: Int(dim))
+        tq_wht_rotate(x, &y, dim)
+
+        #expect(y != x, "WHT should change the vector")
+
+        tq_wht_rotate_inverse(y, &z, dim)
+
+        for i in 0..<Int(dim) {
+            #expect(abs(z[i] - x[i]) < 1e-4,
+                    "WHT inverse element \(i): got \(z[i]), expected \(x[i])")
+        }
+        tq_wht_cleanup()
+    }
+
+    // MARK: - WHT norm preservation
+
+    @Test("WHT rotation preserves L2 norm")
+    func whtPreservesNorm() {
+        let x = makeVector(dim: dim)
+        tq_wht_init(dim, seed)
+
+        var y = [Float](repeating: 0, count: Int(dim))
+        tq_wht_rotate(x, &y, dim)
+
+        let normBefore = l2norm(x)
+        let normAfter  = l2norm(y)
+        #expect(abs(normAfter - normBefore) < 1e-3,
+                "WHT norm before: \(normBefore), after: \(normAfter)")
+        tq_wht_cleanup()
+    }
+
+    // MARK: - WHT determinism
+
+    @Test("WHT: same seed produces same rotation")
+    func whtSameSeedIsDeterministic() {
+        let x = makeVector(dim: dim)
+        var y1 = [Float](repeating: 0, count: Int(dim))
+        var y2 = [Float](repeating: 0, count: Int(dim))
+
+        tq_wht_init(dim, seed)
+        tq_wht_rotate(x, &y1, dim)
+        tq_wht_cleanup()
+
+        tq_wht_init(dim, seed)
+        tq_wht_rotate(x, &y2, dim)
+        tq_wht_cleanup()
+
+        for i in 0..<Int(dim) {
+            #expect(y1[i] == y2[i], "WHT element \(i) differs between identical seeds")
+        }
+    }
+
+    // MARK: - WHT dot-product preservation
+
+    @Test("WHT: dot(WHT(k), WHT(q)) == dot(k, q)")
+    func whtPreservesDotProduct() {
+        let k = makeVector(dim: dim, offset: 0.0)
+        let q = makeVector(dim: dim, offset: 1.1)
+        let dotOriginal = zip(k, q).reduce(0.0 as Float) { $0 + $1.0 * $1.1 }
+
+        tq_wht_init(dim, seed)
+        var kR = [Float](repeating: 0, count: Int(dim))
+        var qR = [Float](repeating: 0, count: Int(dim))
+        tq_wht_rotate(k, &kR, dim)
+        tq_wht_rotate(q, &qR, dim)
+        tq_wht_cleanup()
+
+        let dotRotated = zip(kR, qR).reduce(0.0 as Float) { $0 + $1.0 * $1.1 }
+        #expect(abs(dotRotated - dotOriginal) < 1e-2,
+                "WHT dot after rotation: \(dotRotated), expected: \(dotOriginal)")
+    }
+
+    // MARK: - Dispatch layer
+
+    @Test("tq_dispatch_rotate with HADAMARD matches tq_wht_rotate")
+    func dispatchHadamardMatchesWHT() {
+        let x = makeVector(dim: dim)
+        var y1 = [Float](repeating: 0, count: Int(dim))
+        var y2 = [Float](repeating: 0, count: Int(dim))
+
+        tq_wht_init(dim, seed)
+        tq_wht_rotate(x, &y1, dim)
+        tq_wht_cleanup()
+
+        tq_dispatch_rotate(x, &y2, dim, UInt32(PA_TRANSFORM_HADAMARD.rawValue), seed)
+
+        for i in 0..<Int(dim) {
+            #expect(abs(y1[i] - y2[i]) < 1e-6,
+                    "Dispatch element \(i): \(y2[i]) vs direct \(y1[i])")
+        }
+    }
+
     // MARK: - Query rotation (dot-product preservation)
 
     @Test("tq_rotate_query: dot(Π@k, Π@q) == dot(k, q)")

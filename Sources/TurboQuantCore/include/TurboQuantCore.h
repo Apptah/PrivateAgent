@@ -42,6 +42,33 @@ void tq_rotate_inverse_inplace(float *x, uint32_t dim, uint64_t seed);
 /// Rotate a query vector: q_out = Π @ q_in. q_in and q_out must not alias.
 void tq_rotate_query(const float *q_in, float *q_out, uint32_t dim, uint64_t seed);
 
+// ── Fast Walsh-Hadamard Transform (WHT) ─────────────────────────────────────
+// O(d log d) structured rotation: D₂ @ H @ D₁.
+// dim must be a power of 2.
+
+/// Initialize WHT sign diagonals for the given dim+seed.
+/// Returns 0 on success, -1 if dim is not a power of 2 or on allocation failure.
+int tq_wht_init(uint32_t dim, uint64_t seed);
+
+/// Free WHT cached state.
+void tq_wht_cleanup(void);
+
+/// Forward WHT rotation: y = D₂ @ H @ D₁ @ x.
+void tq_wht_rotate(const float *x, float *y, uint32_t dim);
+
+/// Inverse WHT rotation: x = D₁ @ H @ D₂ @ y.
+void tq_wht_rotate_inverse(const float *y, float *x, uint32_t dim);
+
+// ── Transform dispatch (routes by PA_TransformKind) ─────────────────────────
+
+/// Apply forward rotation using the transform specified by transform_kind.
+void tq_dispatch_rotate(const float *x, float *y, uint32_t dim,
+                         uint32_t transform_kind, uint64_t seed);
+
+/// Apply inverse rotation using the transform specified by transform_kind.
+void tq_dispatch_rotate_inverse(const float *y, float *x, uint32_t dim,
+                                  uint32_t transform_kind, uint64_t seed);
+
 // ── Lloyd-Max quantization ────────────────────────────────────────────────────
 
 /// Quantize a unit-norm rotated vector using Lloyd-Max codebook.
@@ -58,6 +85,16 @@ void tq_dequantize_lloydmax(const uint8_t *codes, float *rotated_unit,
 /// Get Lloyd-Max codebook for given bit width.
 /// Returns pointer to static array of 2^bits centroids (N(0,1) scale).
 const float *tq_lloydmax_codebook(uint8_t bits);
+
+/// Split quantise for fractional bit rates (outlier channel strategy).
+/// bits_x2 encoding: 7 = 3.5-bit (first dim/2 at 4-bit, rest at 3-bit).
+/// Even bits_x2 values delegate to standard tq_quantize_lloydmax.
+uint32_t tq_quantize_lloydmax_split(const float *rotated_unit, uint32_t dim,
+                                      uint8_t *codes, uint16_t bits_x2);
+
+/// Split dequantise (mirrors tq_quantize_lloydmax_split).
+void tq_dequantize_lloydmax_split(const uint8_t *codes, float *rotated_unit,
+                                    uint32_t dim, uint16_t bits_x2);
 
 // ── Backward-compatible scalar quant wrappers ─────────────────────────────────
 
@@ -127,6 +164,49 @@ void tq_decompress_v(const uint8_t *v_compressed, float *v_output,
 /// Backward-compatible alias for tq_decompress_v.
 void tq_decompress_v_tile(const uint8_t *v_compressed, float *v_output,
                            uint32_t dim, const PA_QuantizedKVDesc *desc);
+
+// ── V-specific MSE-only compression (no QJL) ────────────────────────────────
+// V cache uses MSE reconstruction, not inner product → QJL is unnecessary.
+// Layout: [norm: f32, 4 bytes] [codes: dim bytes]. Total: 4 + dim bytes.
+
+/// Get compressed size for a V vector (MSE-only, no QJL).
+uint32_t tq_compressed_size_v(uint32_t dim);
+
+/// Compress a V vector using MSE-only quantization (no QJL residual).
+/// Uses all bits from value_bits_x2 for MSE (no 1-bit QJL reservation).
+/// Returns bytes written, or 0 on error.
+uint32_t tq_compress_v(const float *v_input, uint32_t dim,
+                        uint8_t *compressed_out,
+                        const PA_QuantizedKVDesc *desc);
+
+/// Decompress a V vector from MSE-only format.
+void tq_decompress_v_mse(const uint8_t *v_compressed, float *v_output,
+                           uint32_t dim, const PA_QuantizedKVDesc *desc);
+
+// ── Graph-side rotation (prerotated variants) ───────────────────────────────
+// When graph_side_rotation=1, the caller rotates K/V/Q once in the compute
+// graph (after RoPE). Compress/decompress skip the rotation step entirely.
+// This eliminates 2× O(d log d) per compress + decompress call.
+
+/// Compress a KV vector that is ALREADY rotated (skip rotation step).
+uint32_t tq_compress_kv_prerotated(const float *kv_rotated, uint32_t dim,
+                                     uint8_t *compressed_out,
+                                     const PA_QuantizedKVDesc *desc);
+
+/// Compress a V vector (MSE-only) that is ALREADY rotated.
+uint32_t tq_compress_v_prerotated(const float *v_rotated, uint32_t dim,
+                                    uint8_t *compressed_out,
+                                    const PA_QuantizedKVDesc *desc);
+
+/// Decompress V (MSE-only) without inverse rotation — output stays in rotated space.
+void tq_decompress_v_mse_prerotated(const uint8_t *v_compressed, float *v_output,
+                                      uint32_t dim, const PA_QuantizedKVDesc *desc);
+
+/// Compute dot(q_rotated, decompress_k) where q is ALREADY rotated.
+/// K is decompressed without inverse rotation (stays in rotated space).
+float tq_compressed_dot_prerotated(const float *q_rotated, uint32_t dim,
+                                     const uint8_t *k_compressed,
+                                     const PA_QuantizedKVDesc *desc);
 
 #ifdef __cplusplus
 }

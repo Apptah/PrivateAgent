@@ -58,6 +58,9 @@ typedef struct {
     uint64_t aux_params_offset;  // 0 if aux_params_kind == PA_AUX_NONE
     uint64_t qjl_bits_offset;
     uint32_t aux_params_kind;    // PA_AuxParamsKind
+    uint8_t  v_uses_qjl;        // 0 = V uses MSE-only (default), 1 = V uses full TurboQuant
+    uint8_t  graph_side_rotation; // 0 = rotate in compress/decompress, 1 = rotate in graph
+    uint8_t  _reserved[2];      // padding for alignment
 } PA_QuantizedKVDesc;
 
 // ── Layer type ──

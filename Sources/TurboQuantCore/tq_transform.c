@@ -212,3 +212,145 @@ void tq_rotate_query(const float *q_in, float *q_out, uint32_t dim, uint64_t see
     rotate_locked(q_in, q_out, dim);
     pthread_mutex_unlock(&g_rotation_mutex);
 }
+
+// ══════════════════════════════════════════════════════════════════════════════
+// Fast Walsh-Hadamard Transform (WHT) — O(d log d) structured rotation
+// ══════════════════════════════════════════════════════════════════════════════
+//
+// Replaces the dense QR rotation with D₂ @ H @ D₁ where:
+//   D₁, D₂ = random sign-flip diagonals ∈ {-1, +1}
+//   H       = Walsh-Hadamard matrix (orthogonal, self-inverse up to scaling)
+//
+// Complexity: O(d log d) vs O(d²) for dense matrix multiply.
+// Memory:     2*dim bytes vs dim*dim*4 bytes.
+
+static int8_t   *g_wht_d1    = NULL;
+static int8_t   *g_wht_d2    = NULL;
+static uint32_t  g_wht_dim   = 0;
+static pthread_mutex_t g_wht_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+// Generate a random sign-flip diagonal: each entry is +1 or -1
+static void generate_sign_diag(int8_t *diag, uint32_t dim, uint64_t seed) {
+    uint64_t state = seed;
+    for (uint32_t i = 0; i < dim; i++) {
+        diag[i] = (splitmix64(&state) & 1) ? 1 : -1;
+    }
+}
+
+// In-place element-wise sign flip: x[i] *= diag[i]
+static void apply_sign_diag(float *x, const int8_t *diag, uint32_t dim) {
+    for (uint32_t i = 0; i < dim; i++) {
+        if (diag[i] < 0) x[i] = -x[i];
+    }
+}
+
+// In-place iterative Fast Walsh-Hadamard Transform.
+// dim must be a power of 2. Normalizes by 1/sqrt(dim).
+static void fwht_inplace(float *x, uint32_t dim) {
+    for (uint32_t len = 1; len < dim; len <<= 1) {
+        for (uint32_t i = 0; i < dim; i += len << 1) {
+            for (uint32_t j = 0; j < len; j++) {
+                float a = x[i + j];
+                float b = x[i + j + len];
+                x[i + j]       = a + b;
+                x[i + j + len] = a - b;
+            }
+        }
+    }
+    float scale = 1.0f / sqrtf((float)dim);
+    for (uint32_t i = 0; i < dim; i++) x[i] *= scale;
+}
+
+int tq_wht_init(uint32_t dim, uint64_t seed) {
+    if ((dim & (dim - 1)) != 0 || dim == 0) return -1;  // must be power of 2
+
+    pthread_mutex_lock(&g_wht_mutex);
+    free(g_wht_d1);
+    free(g_wht_d2);
+    g_wht_d1 = NULL;
+    g_wht_d2 = NULL;
+    g_wht_dim = 0;
+
+    g_wht_d1 = (int8_t *)malloc(dim);
+    g_wht_d2 = (int8_t *)malloc(dim);
+    if (!g_wht_d1 || !g_wht_d2) {
+        free(g_wht_d1); free(g_wht_d2);
+        g_wht_d1 = NULL; g_wht_d2 = NULL;
+        pthread_mutex_unlock(&g_wht_mutex);
+        return -1;
+    }
+
+    generate_sign_diag(g_wht_d1, dim, seed);
+    generate_sign_diag(g_wht_d2, dim, seed ^ 0x1234567890ABCDEFULL);
+
+    g_wht_dim = dim;
+    pthread_mutex_unlock(&g_wht_mutex);
+    return 0;
+}
+
+void tq_wht_cleanup(void) {
+    pthread_mutex_lock(&g_wht_mutex);
+    free(g_wht_d1); free(g_wht_d2);
+    g_wht_d1 = NULL; g_wht_d2 = NULL;
+    g_wht_dim = 0;
+    pthread_mutex_unlock(&g_wht_mutex);
+}
+
+void tq_wht_rotate(const float *x, float *y, uint32_t dim) {
+    pthread_mutex_lock(&g_wht_mutex);
+    if (!g_wht_d1 || dim != g_wht_dim) {
+        pthread_mutex_unlock(&g_wht_mutex);
+        return;
+    }
+    memcpy(y, x, dim * sizeof(float));
+    apply_sign_diag(y, g_wht_d1, dim);
+    fwht_inplace(y, dim);
+    apply_sign_diag(y, g_wht_d2, dim);
+    pthread_mutex_unlock(&g_wht_mutex);
+}
+
+void tq_wht_rotate_inverse(const float *y, float *x, uint32_t dim) {
+    pthread_mutex_lock(&g_wht_mutex);
+    if (!g_wht_d1 || dim != g_wht_dim) {
+        pthread_mutex_unlock(&g_wht_mutex);
+        return;
+    }
+    // Inverse = D₁ @ H @ D₂ (reverse order; H is self-inverse up to scaling,
+    // and D is self-inverse since diag entries are ±1)
+    memcpy(x, y, dim * sizeof(float));
+    apply_sign_diag(x, g_wht_d2, dim);
+    fwht_inplace(x, dim);
+    apply_sign_diag(x, g_wht_d1, dim);
+    pthread_mutex_unlock(&g_wht_mutex);
+}
+
+// ── Dispatch layer: route by transform_kind ─────────────────────────────────
+
+void tq_dispatch_rotate(const float *x, float *y, uint32_t dim,
+                         uint32_t transform_kind, uint64_t seed) {
+    if (transform_kind == PA_TRANSFORM_HADAMARD) {
+        pthread_mutex_lock(&g_wht_mutex);
+        int need_init = (!g_wht_d1 || dim != g_wht_dim);
+        pthread_mutex_unlock(&g_wht_mutex);
+        if (need_init) tq_wht_init(dim, seed);
+        tq_wht_rotate(x, y, dim);
+    } else {
+        // Default: structured rotation (QR)
+        tq_rotation_init(dim, seed);
+        tq_rotate(x, y, dim);
+    }
+}
+
+void tq_dispatch_rotate_inverse(const float *y, float *x, uint32_t dim,
+                                  uint32_t transform_kind, uint64_t seed) {
+    if (transform_kind == PA_TRANSFORM_HADAMARD) {
+        pthread_mutex_lock(&g_wht_mutex);
+        int need_init = (!g_wht_d1 || dim != g_wht_dim);
+        pthread_mutex_unlock(&g_wht_mutex);
+        if (need_init) tq_wht_init(dim, seed);
+        tq_wht_rotate_inverse(y, x, dim);
+    } else {
+        tq_rotation_init(dim, seed);
+        tq_rotate_inverse(y, x, dim);
+    }
+}
