@@ -4,8 +4,8 @@
     "expert_layout": {
         "quant_bits": 4,
         "dense_quant_bits": 4,
-        "expert_size_each": 7000000,
-        "expert_layers": 40
+        "expert_size_each": 2975232,
+        "expert_layers": 30
     },
     "turboquant_defaults": {
         "key_bits_x2": 7,

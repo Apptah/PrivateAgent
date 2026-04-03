@@ -8,7 +8,7 @@ struct CatalogTests {
     func bundledCatalog() async {
         let entries = await ModelCatalog.shared.entries
         #expect(entries.count >= 2)
-        #expect(entries[0].id == "qwen3.5-35b-a3b-q4")
+        #expect(entries[0].id == "gemma4-26b-a4b-q4")
         #expect(entries[0].files.count > 0)
         #expect(entries[0].totalSizeGB > 10)
     }
@@ -24,9 +24,9 @@ struct CatalogTests {
 
     @Test("Lookup entry by id")
     func lookupById() async {
-        let entry = await ModelCatalog.shared.entry(id: "qwen3.5-35b-a3b-q4")
+        let entry = await ModelCatalog.shared.entry(id: "gemma4-26b-a4b-q4")
         #expect(entry != nil)
-        #expect(entry?.displayName.contains("35B") == true)
+        #expect(entry?.displayName.contains("26B") == true)
     }
 
     @Test("Missing id returns nil")
